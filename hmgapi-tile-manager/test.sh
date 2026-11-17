@@ -16,6 +16,8 @@ check "built: TileManager.apk exists" yes "$(test -f "$B/app/TileManager.apk" &&
 HOOK_STRINGS=$(unzip -p "$B/hooks.jar" classes.dex | strings)
 has "hooks.jar contains TileModEntry" "Ldev/lemoyne/tiles/hook/TileModEntry;" "$HOOK_STRINGS"
 has "hooks.jar contains TileStore" "Ldev/lemoyne/tiles/hook/TileStore;" "$HOOK_STRINGS"
+has "hooks.jar contains FilterableMenuList" "Ldev/lemoyne/tiles/hook/TileStore\$FilterableMenuList;" "$HOOK_STRINGS"
+has "hooks.jar contains EntryInspector" "Ldev/lemoyne/tiles/hook/TileStore\$EntryInspector;" "$HOOK_STRINGS"
 
 APK_STRINGS=$(unzip -p "$B/app/TileManager.apk" classes.dex | strings)
 has "apk contains MainActivity" "Ldev/lemoyne/tiles/MainActivity;" "$APK_STRINGS"

@@ -63,7 +63,7 @@ Home Screen Tile Manager uses HMG-API's `launcher.*` and `homesetting.*` hook po
 
 | Vehicle | Firmware Tested | HMG-API |
 |---|---|---|
-| Hyundai Ioniq 5 (`NEEV`, `NEEV23`, `NEEV23SE`, US) | `260507`, `260903` | `1.1.0-rc.3` |
+| Hyundai Ioniq 5 (`NEEV`, `NEEV23`, `NEEV23SE`, US) | `260507`, `260903` | `1.1.0-rc.3`, `1.1.1-rc.4` |
 
 Tried it on another Hyundai, Kia, or Genesis Gen5W vehicle? Open a [Car Compatibility Report](../../issues/new?template=car-report.yml) to add your model to the table!
 

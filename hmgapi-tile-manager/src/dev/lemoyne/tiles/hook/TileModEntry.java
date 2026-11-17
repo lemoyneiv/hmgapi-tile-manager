@@ -10,6 +10,7 @@ import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.res.Resources;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
@@ -24,7 +25,6 @@ import java.io.File;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -33,15 +33,17 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * HMG-API hook entry for Home Screen Tile Manager on stock Open-HMG/HMG-API:
- *  - com.android.launcher3: records the complete launcher catalog (stock + mod tiles),
- *    pushes it to TileCatalogProvider, filters hidden tiles from the live menu list,
- *    synchronises content://com.hkmc.system.app.homesetting.provider/all_menu with
- *    exact itemId/slot backup & optional gap compaction, and applies changes live.
- *  - com.hkmc.system.app.homesetting: filters hidden tiles out of the Home Screen
- *    Menu Editor and updates live when tile settings change.
+ *  - com.android.launcher3: inspects all menu entries (7-arg + overloaded constructors), wraps
+ *    launcher.menu_list.items in FilterableMenuList so mod/custom tiles added later by HMG-API's
+ *    LIFO afterHookedMethod or NEMESIS are captured and filtered, excludes unequipped trim/region
+ *    ghost stock tiles via all_menu, pushes the schema-2 catalog to TileCatalogProvider, and
+ *    synchronises all_menu with exact itemId/slot backup & optional gap compaction.
+ *  - com.hkmc.system.app.homesetting: wraps homesetting.edit_list.items in FilterableMenuList so
+ *    both stock and mod/custom hidden tiles stay hidden in Edit Home Icons and update live.
  */
 public final class TileModEntry extends ModEntry {
     static final String PKG_LAUNCHER = "com.android.launcher3";
@@ -50,6 +52,7 @@ public final class TileModEntry extends ModEntry {
     static final Uri ALL_MENU = Uri.parse("content://com.hkmc.system.app.homesetting.provider/all_menu");
     static final Uri CATALOG_URI = Uri.parse("content://" + TileStore.PROVIDER_AUTH);
     static final File PUBLIC_STATE = new File("/data/hmgapi/public/state.json");
+    static final File MODS_ROOT = new File("/data/hmgapi/mods");
 
     static final class EntryMeta {
         final String key;
@@ -58,30 +61,38 @@ public final class TileModEntry extends ModEntry {
         final String title;
         final String kind;
         final String modId;
+        final int itemId;
 
-        EntryMeta(String key, String pkg, String cls, String title, String kind, String modId) {
+        EntryMeta(String key, String pkg, String cls, String title, String kind, String modId, int itemId) {
             this.key = key;
             this.pkg = pkg;
             this.cls = cls;
             this.title = title;
             this.kind = kind;
             this.modId = modId;
+            this.itemId = itemId;
         }
     }
 
     private static final Map<Object, EntryMeta> metaByEntry = new WeakHashMap<Object, EntryMeta>();
     private static final Map<String, String> keyByClassName = new LinkedHashMap<String, String>();
+    private static final TileStore.EntryInspector launcherInspector = new TileStore.EntryInspector();
+    private static final TileStore.EntryInspector editorInspector = new TileStore.EntryInspector();
+
     private static final Object SYNC_LOCK = new Object();
     private static final AtomicBoolean launcherReloadPending = new AtomicBoolean(false);
+    private static final AtomicInteger postLoadSeq = new AtomicInteger(0);
 
     private static volatile boolean launcherReceiverStarted;
     private static volatile boolean editorReceiverStarted;
     private static volatile String lastCatalogJson;
     private static volatile String lastAppliedSignature;
 
-    private static ClassLoader editorLoader;
-    private static List<Object> liveEditorList;
-    private static List<Object> allEditorItems;
+    private static volatile TileStore.FilterableMenuList liveLauncherList;
+    private static volatile Object liveLauncherLock;
+
+    private static volatile ClassLoader editorLoader;
+    private static volatile TileStore.FilterableMenuList liveEditorList;
 
     @Override
     public void appLoaded(final ModContext mod, final LoadedApp app) {
@@ -102,7 +113,11 @@ public final class TileModEntry extends ModEntry {
             }
         }
         final ClassLoader cl = app.classLoader;
-        hookEntryCtor(mod, cl, "launcher.menu_entry.new", app.context);
+        final Field itemsField = Points.field(cl, "launcher.menu_list.items");
+        if (app.context != null) {
+            startLauncherReceiver(mod, app.context);
+        }
+        hookEntryCtor(mod, cl, "launcher.menu_entry.new", app.context, launcherInspector);
 
         mod.hook(cl, "launcher.menu_list.load", new MethodHook() {
             @Override
@@ -111,16 +126,16 @@ public final class TileModEntry extends ModEntry {
                 try {
                     Context ctx = (Context) Points.call(cl, "launcher.menu_list.get_context", p.thisObject);
                     if (ctx == null) ctx = app.context;
-                    List<Object> list = (List<Object>) Points.get(cl, "launcher.menu_list.items", p.thisObject);
+                    List<Object> list = (List<Object>) itemsField.get(p.thisObject);
                     Object lock = Points.get(cl, "launcher.menu_list.lock", p.thisObject);
                     if (list == null || lock == null) return;
-                    onLauncherLoaded(mod, ctx, list, lock);
+                    onLauncherLoaded(mod, ctx, p.thisObject, itemsField, list, lock);
                 } catch (Throwable t) {
                     mod.error("launcher.menu_list.load", t);
                 }
             }
         });
-        mod.log("launcher tile manager active in " + app.processName);
+        mod.log("launcher tile manager v1.0.1 active in " + app.processName);
     }
 
     private void hookEditor(final ModContext mod, final LoadedApp app) {
@@ -135,7 +150,10 @@ public final class TileModEntry extends ModEntry {
         }
         final ClassLoader cl = app.classLoader;
         final Field itemsField = Points.field(cl, "homesetting.edit_list.items");
-        hookEntryCtor(mod, cl, "homesetting.edit_entry.new", app.context);
+        if (app.context != null) {
+            startEditorReceiver(mod, app.context);
+        }
+        hookEntryCtor(mod, cl, "homesetting.edit_entry.new", app.context, editorInspector);
 
         mod.hook(cl, "homesetting.edit_list.load", new MethodHook() {
             @Override
@@ -146,32 +164,31 @@ public final class TileModEntry extends ModEntry {
                     if (ctx == null) ctx = app.context;
                     List<Object> list = (List<Object>) itemsField.get(null);
                     if (list == null) return;
-                    onEditorLoaded(mod, ctx, cl, list);
+                    onEditorLoaded(mod, ctx, cl, itemsField, list);
                 } catch (Throwable t) {
                     mod.error("homesetting.edit_list.load", t);
                 }
             }
         });
-        mod.log("menu editor tile manager active in " + app.processName);
+        mod.log("menu editor tile manager v1.0.1 active in " + app.processName);
     }
 
-    private static void hookEntryCtor(final ModContext mod, ClassLoader cl, String pointId, final Context fallbackCtx) {
+    private static void hookEntryCtor(final ModContext mod, ClassLoader cl, String pointId,
+                                      final Context fallbackCtx, final TileStore.EntryInspector inspector) {
         mod.hook(cl, pointId, new MethodHook() {
             @Override
             protected void afterHookedMethod(Param param) {
                 try {
                     if (param.thisObject == null || param.args == null || param.args.length < 7) return;
                     Context ctx = param.args[1] instanceof Context ? (Context) param.args[1] : fallbackCtx;
-                    String pkg = param.args[2] == null ? "" : String.valueOf(param.args[2]);
-                    String cls = param.args[3] == null ? "" : String.valueOf(param.args[3]);
+                    String pkg = TileStore.cleanToken(param.args[2]);
+                    String cls = TileStore.cleanToken(param.args[3]);
+                    int iconId = param.args[4] instanceof Integer ? ((Integer) param.args[4]).intValue() : 0;
+                    int iconDisId = param.args[5] instanceof Integer ? ((Integer) param.args[5]).intValue() : 0;
                     int titleId = param.args[6] instanceof Integer ? ((Integer) param.args[6]).intValue() : 0;
-                    EntryMeta meta = buildMeta(ctx, pkg, cls, titleId);
-                    synchronized (metaByEntry) {
-                        metaByEntry.put(param.thisObject, meta);
-                        if (!meta.cls.isEmpty() && !meta.key.isEmpty()) {
-                            keyByClassName.put(meta.cls, meta.key);
-                        }
-                    }
+                    EntryMeta meta = buildMeta(ctx, pkg, cls, titleId, null, -1);
+                    inspector.calibrate(param.thisObject, pkg, cls, iconId, iconDisId, titleId, meta.title);
+                    cacheMeta(param.thisObject, meta);
                 } catch (Throwable t) {
                     mod.error("tile ctor hook", t);
                 }
@@ -179,49 +196,186 @@ public final class TileModEntry extends ModEntry {
         });
     }
 
-    private static EntryMeta buildMeta(Context ctx, String pkg, String cls, int titleId) {
-        String key = TileStore.normKey(pkg, cls);
+    private static void cacheMeta(Object entry, EntryMeta meta) {
+        if (entry == null || meta == null) return;
+        synchronized (metaByEntry) {
+            metaByEntry.put(entry, meta);
+            if (!meta.cls.isEmpty() && !"*".equals(meta.cls) && !meta.key.isEmpty()) {
+                keyByClassName.put(meta.cls, meta.key);
+                keyByClassName.put(TileStore.expandClass(meta.pkg, meta.cls), meta.key);
+            }
+        }
+    }
+
+    private static EntryMeta metaOf(Object entry) {
+        if (entry == null) return null;
+        synchronized (metaByEntry) {
+            return metaByEntry.get(entry);
+        }
+    }
+
+    private static EntryMeta ensureMeta(Context ctx, Object entry, TileStore.EntryInspector inspector,
+                                        TileStore.MenuInventory inv, Set<String> alreadyMatchedKeys,
+                                        ClassLoader editorCl) {
+        EntryMeta cached = metaOf(entry);
+        if (cached != null && !cached.key.isEmpty()) return cached;
+        if (entry == null) return null;
+
+        TileStore.EntryInspector.Extracted ex = inspector.extract(
+                entry, inv, alreadyMatchedKeys, resourceStringProbe(ctx));
+        String pkg = ex != null ? ex.pkg : "";
+        String cls = ex != null ? ex.cls : "";
+        int titleId = ex != null ? ex.titleId : 0;
+        String titleText = ex != null ? ex.titleText : "";
+        int itemId = ex != null ? ex.matchedItemId : -1;
+
+        if (cls.isEmpty() && editorCl != null) {
+            try {
+                String c = TileStore.cleanToken(Points.call(editorCl, "homesetting.edit_entry.get_class_name", entry));
+                if (!c.isEmpty()) {
+                    cls = c;
+                    if (pkg.isEmpty() && inv != null) {
+                        String mappedPkg = inv.classToPackage.get(c);
+                        if (mappedPkg != null) pkg = mappedPkg;
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        if (pkg.isEmpty() && !cls.isEmpty()) {
+            synchronized (metaByEntry) {
+                String knownKey = keyByClassName.get(cls);
+                if (knownKey != null) {
+                    int slash = knownKey.indexOf('/');
+                    if (slash > 0 && !knownKey.startsWith("@")) {
+                        pkg = knownKey.substring(0, slash);
+                    }
+                }
+            }
+        }
+
+        EntryMeta built = buildMeta(ctx, pkg, cls, titleId, titleText, itemId);
+        if (!built.key.isEmpty()) {
+            cacheMeta(entry, built);
+        }
+        return built;
+    }
+
+    private static TileStore.IntStringProbe resourceStringProbe(final Context ctx) {
+        if (ctx == null) return null;
+        return new TileStore.IntStringProbe() {
+            @Override
+            public String resolveStringResource(int resId) {
+                if (resId == 0) return null;
+                try {
+                    Resources res = ctx.getResources();
+                    if ((resId & 0xffff0000) == 0x7f7e0000) {
+                        if (((resId - 0x7f7e0000) % 3) != 0) return null;
+                        CharSequence cs = res.getText(resId);
+                        return cs != null ? cs.toString() : null;
+                    }
+                    if (!"string".equals(res.getResourceTypeName(resId))) return null;
+                    CharSequence cs = res.getText(resId);
+                    return cs != null ? cs.toString() : null;
+                } catch (Throwable ignored) {
+                    return null;
+                }
+            }
+        };
+    }
+
+    private static EntryMeta buildMeta(Context ctx, String rawPkg, String rawCls,
+                                       int titleId, String fallbackTitleText, int itemId) {
+        String pkg = TileStore.cleanToken(rawPkg);
+        String cls = TileStore.cleanToken(rawCls);
+        String key = TileStore.normKey(pkg, cls, itemId);
         String title = null;
+
         if (ctx != null && titleId != 0) {
             try {
                 CharSequence cs = ctx.getResources().getText(titleId);
                 if (cs != null) title = cs.toString();
             } catch (Throwable ignored) {}
         }
+        if ((title == null || title.trim().isEmpty()) && fallbackTitleText != null && !fallbackTitleText.trim().isEmpty()) {
+            title = fallbackTitleText.trim();
+        }
+
+        TileStore.ModLauncherSpec modSpec = findModLauncherSpec(pkg, cls);
+        if ((title == null || title.trim().isEmpty()) && modSpec != null && !modSpec.title.isEmpty()) {
+            title = modSpec.title;
+        }
+
         boolean isUserPkg = false;
         if (ctx != null && !pkg.isEmpty()) {
             try {
                 PackageManager pm = ctx.getPackageManager();
-                String fullCls = cls.startsWith(".") ? pkg + cls : cls;
-                if ((title == null || title.trim().isEmpty()) && !fullCls.isEmpty()) {
-                    ActivityInfo ai = pm.getActivityInfo(new ComponentName(pkg, fullCls), 0);
-                    CharSequence cs = ai.loadLabel(pm);
-                    if (cs != null) title = cs.toString();
+                String fullCls = TileStore.expandClass(pkg, cls);
+                if ((title == null || title.trim().isEmpty()) && !fullCls.isEmpty() && !"*".equals(fullCls)) {
+                    try {
+                        ActivityInfo ai = pm.getActivityInfo(new ComponentName(pkg, fullCls), 0);
+                        CharSequence cs = ai.loadLabel(pm);
+                        if (cs != null) title = cs.toString();
+                    } catch (Throwable ignored) {}
                 }
                 ApplicationInfo appInfo = pm.getApplicationInfo(pkg, 0);
                 if ((appInfo.flags & ApplicationInfo.FLAG_SYSTEM) == 0) {
                     isUserPkg = true;
                 }
+                if (title == null || title.trim().isEmpty()) {
+                    CharSequence appLabel = pm.getApplicationLabel(appInfo);
+                    if (appLabel != null) title = appLabel.toString();
+                }
             } catch (Throwable ignored) {}
         }
-        if (title == null || title.trim().isEmpty()) {
-            int dot = cls.lastIndexOf('.');
-            title = dot >= 0 && dot + 1 < cls.length() ? cls.substring(dot + 1) : (!cls.isEmpty() ? cls : pkg);
-        }
+
+        if (title == null) title = "";
         title = title.replace('\n', ' ').replace('\r', ' ').replaceAll(" +", " ").trim();
 
         boolean isHmgRes = (titleId & 0xffff0000) == 0x7f7e0000;
-        boolean isHmgApp = "hmgapi.app".equals(pkg);
-        boolean isNemesis = "com.nemesis.manager".equals(pkg)
-                || pkg.startsWith("com.nemesis.")
-                || title.toUpperCase(Locale.US).contains("NEMESIS");
-        String modId = resolveModIdForPackage(pkg);
+        boolean isHmgApp = "hmgapi.app".equals(pkg) || pkg.startsWith("hmgapi.");
+        String lowPkg = pkg.toLowerCase(Locale.US);
+        boolean isNemesis = lowPkg.contains("nemesis") || lowPkg.contains("xwtk")
+                || title.toUpperCase(Locale.US).contains("NEMESIS")
+                || itemId == 90;
+
+        String modId = modSpec != null ? modSpec.modId : resolveModIdForPackage(pkg);
         if (modId == null) {
             if (isHmgApp) modId = "hmgapi";
             else if (isNemesis) modId = "nemesis";
         }
-        String kind = (isHmgRes || isHmgApp || isNemesis || isUserPkg || modId != null) ? "package" : "system";
-        return new EntryMeta(key, pkg, cls, title, kind, modId);
+
+        boolean nonStockPkg = !pkg.isEmpty() && !TileStore.isStockOemPackage(pkg);
+        String kind = (isHmgRes || isHmgApp || isNemesis || isUserPkg || modId != null
+                || nonStockPkg || itemId >= 9000) ? "package" : "system";
+
+        if ("hmgapi".equals(modId) && (title.isEmpty() || title.equals(pkg))) {
+            title = "HMG-API";
+        } else if ("system".equals(kind) && titleId == 0) {
+            title = TileStore.friendlySystemTitle(title, pkg, cls);
+        } else if (title.isEmpty()) {
+            if (!cls.isEmpty() && !"*".equals(cls)) {
+                int dot = cls.lastIndexOf('.');
+                title = dot >= 0 && dot + 1 < cls.length() ? cls.substring(dot + 1) : cls;
+            } else if (!pkg.isEmpty()) {
+                title = pkg;
+            } else {
+                title = "Home Tile";
+            }
+        }
+
+        return new EntryMeta(key, pkg, cls, title, kind, modId, itemId);
+    }
+
+    private static TileStore.ModLauncherSpec findModLauncherSpec(String pkg, String cls) {
+        if (pkg == null || pkg.isEmpty()) return null;
+        String targetKey = TileStore.normKey(pkg, cls);
+        for (TileStore.ModLauncherSpec spec : TileStore.readHmgApiLauncherMods(PUBLIC_STATE, MODS_ROOT)) {
+            if (targetKey.equals(spec.key) || ("*".equals(cls) || cls.isEmpty()) && pkg.equals(spec.packageName)) {
+                return spec;
+            }
+        }
+        return null;
     }
 
     @SuppressWarnings("unchecked")
@@ -244,112 +398,280 @@ public final class TileModEntry extends ModEntry {
         return null;
     }
 
-    private static EntryMeta metaOf(Object entry) {
-        synchronized (metaByEntry) {
-            return metaByEntry.get(entry);
+    private static void preSeedMatchedKeys(Iterable<?> items, Set<String> matchedKeys) {
+        if (items == null || matchedKeys == null) return;
+        for (Object item : items) {
+            EntryMeta m = metaOf(item);
+            if (m != null && !m.key.isEmpty()) matchedKeys.add(m.key);
         }
     }
 
-    private static void onLauncherLoaded(ModContext mod, Context ctx, List<Object> list, Object lock) {
+    private static void onLauncherLoaded(final ModContext mod, final Context ctx, final Object menuListOwner,
+                                         final Field itemsField, List<Object> list, final Object lock) {
         if (ctx != null) startLauncherReceiver(mod, ctx);
 
-        Map<String, Map<String, Object>> catalogByKey = new LinkedHashMap<String, Map<String, Object>>();
+        final TileStore.MenuInventory initialInv = readMenuInventory(ctx);
+        final TileStore.Config initialCfg = effectiveConfig(mod, ctx, null);
+        lastAppliedSignature = initialCfg.signature(mod.enabled());
+
+        final AtomicBoolean postHooksActive = new AtomicBoolean(false);
+        final Set<String> matchedKeys = new LinkedHashSet<String>();
         synchronized (lock) {
-            for (Object item : list) {
-                EntryMeta m = metaOf(item);
-                if (m == null || m.key.isEmpty() || catalogByKey.containsKey(m.key)) continue;
-                Map<String, Object> row = new LinkedHashMap<String, Object>();
-                row.put("key", m.key);
-                row.put("packageName", m.pkg);
-                row.put("className", m.cls);
-                row.put("title", m.title);
-                row.put("kind", m.kind);
-                if (m.modId != null) row.put("mod", m.modId);
-                catalogByKey.put(m.key, row);
-            }
+            preSeedMatchedKeys(list, matchedKeys);
         }
 
-        Set<String> installedKeys = new LinkedHashSet<String>(catalogByKey.keySet());
-        if (!catalogByKey.isEmpty()) {
-            Map<String, Object> doc = new LinkedHashMap<String, Object>();
-            doc.put("tiles", new ArrayList<Object>(catalogByKey.values()));
-            String catJson = TileStore.writeCompact(doc);
-            lastCatalogJson = catJson;
-            pushCatalogAsync(ctx, catJson);
-        }
-
-        TileStore.Config cfg = effectiveConfig(mod, ctx, null);
-        lastAppliedSignature = cfg.signature(mod.enabled());
-
-        if (!cfg.hidden.isEmpty()) {
-            int removed = 0;
-            synchronized (lock) {
-                for (Iterator<Object> it = list.iterator(); it.hasNext();) {
-                    EntryMeta m = metaOf(it.next());
-                    if (m != null && !m.key.isEmpty() && cfg.hidden.contains(m.key)) {
-                        it.remove();
-                        removed++;
-                    }
+        TileStore.ItemVisibilityFilter filter = new TileStore.ItemVisibilityFilter() {
+            @Override
+            public void onItemAdded(Object item) {
+                EntryMeta m = ensureMeta(ctx, item, launcherInspector, initialInv, matchedKeys, null);
+                if (m != null && !m.key.isEmpty()) {
+                    matchedKeys.add(m.key);
+                }
+                if (postHooksActive.get()) {
+                    schedulePostLoadFinalize(mod, ctx);
                 }
             }
-            if (removed > 0) mod.log("launcher: hid " + removed + " tile(s)");
+
+            @Override
+            public boolean shouldShow(Object item) {
+                if (!mod.enabled()) return true;
+                EntryMeta m = ensureMeta(ctx, item, launcherInspector, initialInv, matchedKeys, null);
+                if (m == null || m.key.isEmpty()) return true;
+                return TileStore.matchingHiddenKey(initialCfg.hidden, m.pkg, m.cls, m.itemId) == null;
+            }
+        };
+
+        TileStore.FilterableMenuList managed;
+        int hiddenNow;
+        synchronized (lock) {
+            if (list instanceof TileStore.FilterableMenuList) {
+                managed = (TileStore.FilterableMenuList) list;
+                hiddenNow = managed.resetFrom(list, filter);
+            } else {
+                managed = new TileStore.FilterableMenuList(list, filter);
+                hiddenNow = list.size() - managed.size();
+                try {
+                    itemsField.set(menuListOwner, managed);
+                } catch (Throwable t) {
+                    mod.error("wrap launcher.menu_list.items", t);
+                }
+            }
+            liveLauncherList = managed;
+            liveLauncherLock = lock;
+        }
+        if (hiddenNow > 0) {
+            mod.log("launcher: hid " + hiddenNow + " tile(s) from menu list");
         }
 
+        // Sync saved menu immediately for stock tiles so gaps are compacted before HmgApi.syncSavedMenu runs
         if (ctx != null) {
-            syncSavedMenu(mod, ctx, cfg, installedKeys.isEmpty() ? null : installedKeys);
+            syncSavedMenu(mod, ctx, initialCfg, null);
         }
+
+        // Enable post-hook listener for HmgApi.launcher (which runs next in LIFO afterHookedMethod order)
+        // and schedule post-load finalisation once HmgApi.launcher + HmgApi.syncSavedMenu complete.
+        postHooksActive.set(true);
+        schedulePostLoadFinalize(mod, ctx);
     }
 
-    private static void pushCatalogAsync(final Context ctx, final String catJson) {
-        if (ctx == null || catJson == null) return;
-        new Thread("hmgapi-tiles-catalog") {
+    private static void schedulePostLoadFinalize(final ModContext mod, final Context ctx) {
+        if (ctx == null) return;
+        final int seq = postLoadSeq.incrementAndGet();
+        new Thread("hmgapi-tiles-postload") {
             @Override
             public void run() {
                 try {
-                    ctx.getContentResolver().call(CATALOG_URI, "putCatalog", catJson, null);
-                } catch (Throwable ignored) {
-                    // TileManager.apk not installed yet or starting up; ACTION_REQUEST_CATALOG retries on open
+                    Thread.sleep(220);
+                    if (seq != postLoadSeq.get()) return;
+                    refreshCatalogAndSync(mod, ctx);
+                } catch (Throwable t) {
+                    mod.error("post-load tile finalize", t);
                 }
             }
         }.start();
     }
 
-    private static void onEditorLoaded(ModContext mod, Context ctx, ClassLoader cl, List<Object> list) {
-        if (ctx != null) startEditorReceiver(mod, ctx);
-        synchronized (list) {
-            editorLoader = cl;
-            liveEditorList = list;
-            allEditorItems = new ArrayList<Object>(list);
-            filterEditorLocked(mod, ctx, cl, list, null);
+    private static void refreshCatalogAndSync(ModContext mod, Context ctx) {
+        if (ctx == null) return;
+        List<Object> rawItems = snapshotLauncherRawItems();
+        TileStore.MenuInventory inv = readMenuInventory(ctx);
+        TileStore.Config cfg = effectiveConfig(mod, ctx, null);
+        lastAppliedSignature = cfg.signature(mod.enabled());
+
+        String catJson = buildCatalogJson(ctx, rawItems, inv, cfg);
+        if (catJson != null) {
+            lastCatalogJson = catJson;
+            pushCatalogSync(ctx, catJson);
+        }
+        syncSavedMenu(mod, ctx, cfg, installedCatalogKeys(ctx));
+    }
+
+    private static List<Object> snapshotLauncherRawItems() {
+        TileStore.FilterableMenuList list = liveLauncherList;
+        Object lock = liveLauncherLock;
+        if (list == null) return Collections.emptyList();
+        if (lock != null) {
+            synchronized (lock) {
+                return list.snapshotRaw();
+            }
+        }
+        return list.snapshotRaw();
+    }
+
+    private static String buildCatalogJson(Context ctx, List<Object> rawItems,
+                                           TileStore.MenuInventory inv, TileStore.Config cfg) {
+        Map<String, Map<String, Object>> catalogByKey = new LinkedHashMap<String, Map<String, Object>>();
+        Set<String> coveredPackages = new LinkedHashSet<String>();
+        Set<String> matchedKeys = new LinkedHashSet<String>();
+        preSeedMatchedKeys(rawItems, matchedKeys);
+
+        // 1. Entries from Launcher_WP3's menu list (stock 7-arg + overloaded ctors + HMG-API mods + NEMESIS)
+        if (rawItems != null) {
+            for (Object item : rawItems) {
+                EntryMeta m = ensureMeta(ctx, item, launcherInspector, inv, matchedKeys, null);
+                if (m == null || m.key.isEmpty()) continue;
+                matchedKeys.add(m.key);
+                if ("system".equals(m.kind)
+                        && !TileStore.isEquippedSystemTile(m.key, m.pkg, m.cls, inv, cfg.hidden)) {
+                    continue; // Exclude unequipped trim/region ghost stock definitions (Built-in Cam, VIBE, etc.)
+                }
+                putCatalogRow(catalogByKey, coveredPackages, m);
+            }
+        }
+
+        // 2. HMG-API's own app + all enabled mods' provides.launcher entries (ensures 100% custom mod
+        //    coverage even if Tile Manager is opened before Launcher_WP3's next load() cycle)
+        if (isPackageInstalled(ctx, "hmgapi.app")) {
+            EntryMeta hmgMeta = buildMeta(ctx, "hmgapi.app", "hmgapi.app.MainActivity", 0, "HMG-API", -1);
+            if (!catalogByKey.containsKey(hmgMeta.key)) {
+                putCatalogRow(catalogByKey, coveredPackages, hmgMeta);
+            }
+        }
+        for (TileStore.ModLauncherSpec spec : TileStore.readHmgApiLauncherMods(PUBLIC_STATE, MODS_ROOT)) {
+            if (!isPackageInstalled(ctx, spec.packageName)) continue;
+            if (catalogByKey.containsKey(spec.key)) continue;
+            EntryMeta m = buildMeta(ctx, spec.packageName, spec.className, 0, spec.title, -1);
+            putCatalogRow(catalogByKey, coveredPackages, m);
+        }
+
+        // 3. Any active or backed-up tile in all_menu that wasn't already represented above
+        if (inv != null) {
+            for (TileStore.MenuEntryRecord rec : inv.activeEntries) {
+                if (catalogByKey.containsKey(rec.key)) continue;
+                if (!rec.packageName.isEmpty() && catalogByKey.containsKey(rec.packageName + "/*")) continue;
+                if (("*".equals(rec.className) || rec.className.isEmpty())
+                        && !rec.packageName.isEmpty() && coveredPackages.contains(rec.packageName)) {
+                    continue;
+                }
+                EntryMeta m = buildMeta(ctx, rec.packageName, rec.className, 0, null, rec.itemId);
+                if (!m.key.isEmpty() && !catalogByKey.containsKey(m.key)) {
+                    putCatalogRow(catalogByKey, coveredPackages, m);
+                }
+            }
+        }
+
+        if (catalogByKey.isEmpty()) return null;
+        Map<String, Object> doc = new LinkedHashMap<String, Object>();
+        doc.put("schema", Long.valueOf(TileStore.CATALOG_SCHEMA));
+        doc.put("tiles", new ArrayList<Object>(catalogByKey.values()));
+        return TileStore.writeCompact(doc);
+    }
+
+    private static void putCatalogRow(Map<String, Map<String, Object>> catalogByKey,
+                                      Set<String> coveredPackages, EntryMeta m) {
+        if (catalogByKey.containsKey(m.key)) return;
+        // If we previously added a package wildcard pkg/* and now have a specific pkg/cls, or vice versa,
+        // avoid duplicate entries for the same single-tile stock package.
+        if (!m.pkg.isEmpty()) {
+            String wildcard = m.pkg + "/*";
+            if (!m.key.equals(wildcard) && catalogByKey.containsKey(wildcard)) {
+                catalogByKey.remove(wildcard);
+            } else if (m.key.equals(wildcard) && coveredPackages.contains(m.pkg)) {
+                return;
+            }
+            coveredPackages.add(m.pkg);
+        }
+        Map<String, Object> row = new LinkedHashMap<String, Object>();
+        row.put("key", m.key);
+        row.put("packageName", m.pkg);
+        row.put("className", m.cls);
+        row.put("title", m.title);
+        row.put("kind", m.kind);
+        if (m.modId != null) row.put("mod", m.modId);
+        catalogByKey.put(m.key, row);
+    }
+
+    private static boolean isPackageInstalled(Context ctx, String pkg) {
+        if (ctx == null || pkg == null || pkg.isEmpty()) return false;
+        try {
+            ctx.getPackageManager().getApplicationInfo(pkg, 0);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
-    private static void filterEditorLocked(ModContext mod, Context ctx, ClassLoader cl, List<Object> list, String overrideJson) {
-        if (allEditorItems == null) return;
-        list.clear();
-        TileStore.Config cfg = effectiveConfig(mod, ctx, overrideJson);
-        int removed = 0;
-        for (Object item : allEditorItems) {
-            EntryMeta m = metaOf(item);
-            String key = m != null ? m.key : "";
-            if (key.isEmpty() && cl != null) {
-                try {
-                    String cls = (String) Points.call(cl, "homesetting.edit_entry.get_class_name", item);
-                    if (cls != null) {
-                        synchronized (metaByEntry) {
-                            String k = keyByClassName.get(cls);
-                            if (k != null) key = k;
-                        }
-                    }
-                } catch (Throwable ignored) {}
-            }
-            if (!key.isEmpty() && cfg.hidden.contains(key)) {
-                removed++;
+    private static void pushCatalogSync(Context ctx, String catJson) {
+        if (ctx == null || catJson == null) return;
+        try {
+            ctx.getContentResolver().call(CATALOG_URI, "putCatalog", catJson, null);
+        } catch (Throwable ignored) {
+            // TileManager.apk not installed yet or starting up; ACTION_REQUEST_CATALOG retries on open
+        }
+    }
+
+    private static void onEditorLoaded(final ModContext mod, final Context ctx, final ClassLoader cl,
+                                       final Field itemsField, List<Object> list) {
+        if (ctx != null) startEditorReceiver(mod, ctx);
+        final TileStore.MenuInventory inv = readMenuInventory(ctx);
+        final Set<String> matchedKeys = new LinkedHashSet<String>();
+        synchronized (list) {
+            preSeedMatchedKeys(list, matchedKeys);
+        }
+
+        TileStore.ItemVisibilityFilter filter = makeEditorFilter(mod, ctx, cl, inv, matchedKeys, null);
+        synchronized (list) {
+            editorLoader = cl;
+            TileStore.FilterableMenuList managed;
+            int hiddenCount;
+            if (list instanceof TileStore.FilterableMenuList) {
+                managed = (TileStore.FilterableMenuList) list;
+                hiddenCount = managed.resetFrom(list, filter);
             } else {
-                list.add(item);
+                managed = new TileStore.FilterableMenuList(list, filter);
+                hiddenCount = list.size() - managed.size();
+                try {
+                    itemsField.set(null, managed);
+                } catch (Throwable t) {
+                    mod.error("wrap homesetting.edit_list.items", t);
+                }
+            }
+            liveEditorList = managed;
+            if (hiddenCount > 0) {
+                mod.log("editor: hid " + hiddenCount + " tile(s)");
             }
         }
-        if (removed > 0) mod.log("editor: hid " + removed + " tile(s)");
+    }
+
+    private static TileStore.ItemVisibilityFilter makeEditorFilter(
+            final ModContext mod, final Context ctx, final ClassLoader cl,
+            final TileStore.MenuInventory inv, final Set<String> matchedKeys, final String overrideJson) {
+        final TileStore.Config currentCfg = effectiveConfig(mod, ctx, overrideJson);
+        return new TileStore.ItemVisibilityFilter() {
+            @Override
+            public void onItemAdded(Object item) {
+                EntryMeta m = ensureMeta(ctx, item, editorInspector, inv, matchedKeys, cl);
+                if (m != null && !m.key.isEmpty()) matchedKeys.add(m.key);
+            }
+
+            @Override
+            public boolean shouldShow(Object item) {
+                if (!mod.enabled()) return true;
+                EntryMeta m = ensureMeta(ctx, item, editorInspector, inv, matchedKeys, cl);
+                if (m == null || m.key.isEmpty()) return true;
+                return TileStore.matchingHiddenKey(currentCfg.hidden, m.pkg, m.cls, m.itemId) == null;
+            }
+        };
     }
 
     private static TileStore.Config effectiveConfig(ModContext mod, Context ctx, String overrideJson) {
@@ -412,14 +734,32 @@ public final class TileModEntry extends ModEntry {
                 public void onReceive(Context c, Intent intent) {
                     String action = intent == null ? null : intent.getAction();
                     if (TileStore.ACTION_REQUEST_CATALOG.equals(action)) {
-                        pushCatalogAsync(appCtx, lastCatalogJson);
+                        new Thread("hmgapi-tiles-req") {
+                            @Override
+                            public void run() {
+                                try {
+                                    List<Object> raw = snapshotLauncherRawItems();
+                                    TileStore.MenuInventory inv = readMenuInventory(appCtx);
+                                    TileStore.Config cfg = effectiveConfig(mod, appCtx, null);
+                                    String freshCat = buildCatalogJson(appCtx, raw, inv, cfg);
+                                    if (freshCat != null) {
+                                        lastCatalogJson = freshCat;
+                                    }
+                                    pushCatalogSync(appCtx, lastCatalogJson);
+                                } catch (Throwable t) {
+                                    mod.error("catalog request", t);
+                                }
+                            }
+                        }.start();
                         return;
                     }
                     final String overrideJson = intent != null ? intent.getStringExtra("config_json") : null;
                     final TileStore.Config nextCfg = effectiveConfig(mod, appCtx, overrideJson);
                     final String nextSig = nextCfg.signature(mod.enabled());
                     if (ACTION_HMGAPI_STATE.equals(action) && nextSig.equals(lastAppliedSignature)) {
-                        return; // Unrelated mod setting change — do not restart launcher!
+                        // A mod may have been installed/enabled/disabled: refresh catalog without killing launcher!
+                        schedulePostLoadFinalize(mod, appCtx);
+                        return;
                     }
                     if (!launcherReloadPending.compareAndSet(false, true)) return;
                     new Thread("hmgapi-tiles-sync") {
@@ -456,20 +796,65 @@ public final class TileModEntry extends ModEntry {
             appCtx.registerReceiver(new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context c, Intent intent) {
-                    List<Object> list = liveEditorList;
+                    final TileStore.FilterableMenuList list = liveEditorList;
                     if (list == null) return;
-                    String overrideJson = intent != null ? intent.getStringExtra("config_json") : null;
-                    synchronized (list) {
-                        try {
-                            filterEditorLocked(mod, appCtx, editorLoader, list, overrideJson);
-                        } catch (Throwable t) {
-                            mod.error("editor live tile filter", t);
+                    final String overrideJson = intent != null ? intent.getStringExtra("config_json") : null;
+                    new Thread("hmgapi-tiles-editor-sync") {
+                        @Override
+                        public void run() {
+                            try {
+                                TileStore.MenuInventory inv = readMenuInventory(appCtx);
+                                Set<String> matched = new LinkedHashSet<String>();
+                                TileStore.ItemVisibilityFilter filter = makeEditorFilter(
+                                        mod, appCtx, editorLoader, inv, matched, overrideJson);
+                                synchronized (list) {
+                                    int hidden = list.refilter(filter);
+                                    if (hidden > 0) mod.log("editor: live hid " + hidden + " tile(s)");
+                                }
+                            } catch (Throwable t) {
+                                mod.error("editor live tile filter", t);
+                            }
                         }
-                    }
+                    }.start();
                 }
             }, f);
             editorReceiverStarted = true;
         }
+    }
+
+    private static TileStore.MenuInventory readMenuInventory(Context ctx) {
+        if (ctx == null) {
+            return TileStore.collectMenuInventory(Collections.<String>emptyList(), null);
+        }
+        List<String> profileJsons = new ArrayList<String>();
+        Map<String, Object> backups = readBackupsMap(ctx);
+        Cursor cur = null;
+        try {
+            cur = ctx.getContentResolver().query(ALL_MENU, null, null, null, null);
+            if (cur != null) {
+                int itemsCol = cur.getColumnIndex("menu_items");
+                while (cur.moveToNext()) {
+                    String json = itemsCol >= 0 ? cur.getString(itemsCol) : null;
+                    if (json != null && !json.isEmpty()) profileJsons.add(json);
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (cur != null) cur.close();
+        }
+        return TileStore.collectMenuInventory(profileJsons, backups);
+    }
+
+    private static Map<String, Object> readBackupsMap(Context ctx) {
+        File bakFile = new File(ctx.getFilesDir(), TileStore.BACKUP_FILE);
+        File legacyBak = new File(ctx.getFilesDir(), TileStore.LEGACY_BACKUP_FILE);
+        File sourceBak = bakFile.isFile() ? bakFile : (legacyBak.isFile() ? legacyBak : null);
+        if (sourceBak != null) {
+            try {
+                return TileStore.parseObject(TileStore.readUtf8(sourceBak));
+            } catch (Throwable ignored) {}
+        }
+        return new LinkedHashMap<String, Object>();
     }
 
     @SuppressWarnings("unchecked")
@@ -485,14 +870,22 @@ public final class TileModEntry extends ModEntry {
             for (Object item : (List<Object>) raw) {
                 if (!(item instanceof Map)) continue;
                 Map<String, Object> row = (Map<String, Object>) item;
-                String pkg = TileStore.str(row.get("packageName"));
-                String cls = TileStore.str(row.get("className"));
-                String key = TileStore.normKey(pkg, cls);
+                String key = TileStore.normKeyString(TileStore.str(row.get("key")));
+                String pkg = TileStore.cleanToken(row.get("packageName"));
+                String cls = TileStore.cleanToken(row.get("className"));
+                String kind = TileStore.cleanToken(row.get("kind"));
+                if (key.isEmpty()) key = TileStore.normKey(pkg, cls);
                 if (key.isEmpty()) continue;
-                if (pm != null && !pkg.isEmpty() && !cls.isEmpty()) {
-                    String fullCls = cls.startsWith(".") ? pkg + cls : cls;
+
+                // Built-in system tiles are part of the head unit ROM and should never have their
+                // saved slot backups pruned as "uninstalled" (even if they use virtual class names).
+                if (!"package".equals(kind)) {
+                    out.add(key);
+                    continue;
+                }
+                if (pm != null && !pkg.isEmpty()) {
                     try {
-                        pm.getActivityInfo(new ComponentName(pkg, fullCls), 0);
+                        pm.getApplicationInfo(pkg, 0);
                         out.add(key);
                     } catch (PackageManager.NameNotFoundException ignored) {}
                 } else {
@@ -512,15 +905,8 @@ public final class TileModEntry extends ModEntry {
             try {
                 File bakFile = new File(ctx.getFilesDir(), TileStore.BACKUP_FILE);
                 File legacyBak = new File(ctx.getFilesDir(), TileStore.LEGACY_BACKUP_FILE);
-                Map<String, Object> backups = new LinkedHashMap<String, Object>();
                 File sourceBak = bakFile.isFile() ? bakFile : (legacyBak.isFile() ? legacyBak : null);
-                if (sourceBak != null) {
-                    try {
-                        backups = TileStore.parseObject(TileStore.readUtf8(sourceBak));
-                    } catch (Throwable ignored) {
-                        backups = new LinkedHashMap<String, Object>();
-                    }
-                }
+                Map<String, Object> backups = readBackupsMap(ctx);
 
                 cur = cr.query(ALL_MENU, null, null, null, null);
                 if (cur == null) return;
@@ -528,8 +914,8 @@ public final class TileModEntry extends ModEntry {
                 int itemsCol = cur.getColumnIndex("menu_items");
                 boolean backupChanged = (sourceBak == legacyBak);
                 while (cur.moveToNext()) {
-                    String user = cur.getString(userCol);
-                    String json = cur.getString(itemsCol);
+                    String user = userCol >= 0 ? cur.getString(userCol) : null;
+                    String json = itemsCol >= 0 ? cur.getString(itemsCol) : null;
                     if (user == null || json == null) continue;
                     TileStore.SyncResult res = TileStore.syncProfileMenu(user, json, cfg, installedKeys, backups);
                     for (String line : res.logs) mod.log(line);

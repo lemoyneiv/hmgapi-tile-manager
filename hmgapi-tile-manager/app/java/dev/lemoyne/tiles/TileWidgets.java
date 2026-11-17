@@ -354,7 +354,7 @@ final class TileWidgets {
         private static Drawable loadInstalledIcon(Context c, String pkg, String cls) {
             if (pkg == null || pkg.isEmpty()) return null;
             PackageManager pm = c.getPackageManager();
-            if (cls != null && !cls.isEmpty()) {
+            if (cls != null && !cls.isEmpty() && !"*".equals(cls)) {
                 String fullCls = cls.startsWith(".") ? pkg + cls : cls;
                 try {
                     return pm.getActivityIcon(new ComponentName(pkg, fullCls));
@@ -378,13 +378,15 @@ final class TileWidgets {
         }
 
         private static String buildSubtitle(TileItem item, boolean showSubClass) {
-            String base = item.packageName;
+            String base = item.packageName != null && !item.packageName.isEmpty()
+                    ? item.packageName : item.key;
             if (item.modId != null && !item.modId.isEmpty()
                     && !"hmgapi".equals(item.modId) && !"nemesis".equals(item.modId)
                     && !item.modId.equals(item.packageName)) {
-                base = item.modId + " · " + item.packageName;
+                base = item.modId + " · " + base;
             }
-            if (showSubClass && item.className != null && !item.className.isEmpty()) {
+            if (showSubClass && item.className != null && !item.className.isEmpty()
+                    && !"*".equals(item.className)) {
                 int dot = item.className.lastIndexOf('.');
                 String shortCls = dot >= 0 ? item.className.substring(dot) : item.className;
                 return base + " (" + shortCls + ")";

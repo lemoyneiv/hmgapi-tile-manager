@@ -62,6 +62,7 @@ public final class MainActivity extends Activity {
     private final Set<String> hiddenKeys = new LinkedHashSet<String>();
     private boolean compactGaps = true;
     private boolean hmgApiConnected;
+    private boolean hookOutdated;
     private int saveGeneration;
 
     // Left rail views
@@ -542,11 +543,13 @@ public final class MainActivity extends Activity {
             }
         }
 
+        boolean loadedOutdated = false;
         List<TileWidgets.TileItem> items = new ArrayList<TileWidgets.TileItem>();
         Set<String> seenKeys = new LinkedHashSet<String>();
         if (catJson != null && !catJson.trim().isEmpty()) {
             try {
                 JSONObject doc = new JSONObject(catJson);
+                loadedOutdated = doc.optBoolean("hook_outdated", false);
                 JSONArray arr = doc.optJSONArray("tiles");
                 if (arr != null) {
                     for (int i = 0; i < arr.length(); i++) {
@@ -554,7 +557,8 @@ public final class MainActivity extends Activity {
                         if (row == null) continue;
                         String pkg = row.optString("packageName", "").trim();
                         String cls = row.optString("className", "").trim();
-                        String key = TileCatalogProvider.normKey(pkg, cls);
+                        String key = TileCatalogProvider.normKeyString(row.optString("key", ""));
+                        if (key.isEmpty()) key = TileCatalogProvider.normKey(pkg, cls);
                         if (key.isEmpty() || seenKeys.contains(key)) continue;
                         seenKeys.add(key);
                         String title = row.optString("title", "").trim();
@@ -569,14 +573,32 @@ public final class MainActivity extends Activity {
 
         // Also surface any hidden keys not yet in catalog so the user can always unhide them
         for (String hk : loadedHidden) {
-            if (seenKeys.contains(hk)) continue;
+            if (seenKeys.contains(hk) || matchesExistingCatalogItem(items, hk)) continue;
             int slash = hk.indexOf('/');
             if (slash <= 0) continue;
-            String pkg = hk.substring(0, slash);
-            String cls = hk.substring(slash + 1);
-            String kind = (pkg.startsWith("com.hkmc.") || pkg.startsWith("com.Hyundai.")
-                    || pkg.startsWith("com.android.")) ? "system" : "package";
-            items.add(new TileWidgets.TileItem(hk, pkg, cls, fallbackTitle(pkg, cls), kind, null, true));
+            String left = hk.substring(0, slash);
+            String right = hk.substring(slash + 1);
+            String pkg;
+            String cls;
+            String title;
+            String kind;
+            if ("@class".equals(left)) {
+                pkg = "";
+                cls = right;
+                title = fallbackTitle("", cls);
+                kind = "system";
+            } else if ("@item".equals(left)) {
+                pkg = "";
+                cls = "";
+                title = "Saved Tile #" + right;
+                kind = "system";
+            } else {
+                pkg = left;
+                cls = right;
+                title = fallbackTitle(pkg, cls);
+                kind = TileCatalogProvider.isStockPackage(pkg) ? "system" : "package";
+            }
+            items.add(new TileWidgets.TileItem(hk, pkg, cls, title, kind, null, true));
         }
 
         Collections.sort(items, new Comparator<TileWidgets.TileItem>() {
@@ -590,6 +612,7 @@ public final class MainActivity extends Activity {
             }
         });
 
+        hookOutdated = loadedOutdated;
         compactGaps = loadedCompact;
         hiddenKeys.clear();
         hiddenKeys.addAll(loadedHidden);
@@ -598,6 +621,51 @@ public final class MainActivity extends Activity {
 
         swCompactGaps.setChecked(compactGaps, false);
         renderAll();
+    }
+
+    private static boolean matchesExistingCatalogItem(List<TileWidgets.TileItem> items, String hiddenKey) {
+        for (TileWidgets.TileItem it : items) {
+            if (hiddenKey.equals(it.key)) return true;
+            if (!it.packageName.isEmpty()) {
+                if (hiddenKey.equals(it.packageName + "/*")) return true;
+                if (("*".equals(it.className) || it.className.isEmpty())
+                        && hiddenKey.startsWith(it.packageName + "/")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean isItemHidden(TileWidgets.TileItem item) {
+        if (hiddenKeys.contains(item.key)) return true;
+        if (item.packageName != null && !item.packageName.isEmpty()) {
+            if (hiddenKeys.contains(item.packageName + "/*")) return true;
+            if ("*".equals(item.className) || item.className == null || item.className.isEmpty()) {
+                String prefix = item.packageName + "/";
+                for (String hk : hiddenKeys) {
+                    if (hk.startsWith(prefix)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void setItemHiddenState(TileWidgets.TileItem item, boolean hidden) {
+        if (!hidden) {
+            hiddenKeys.remove(item.key);
+            if (item.packageName != null && !item.packageName.isEmpty()) {
+                hiddenKeys.remove(item.packageName + "/*");
+                if ("*".equals(item.className) || item.className == null || item.className.isEmpty()) {
+                    String prefix = item.packageName + "/";
+                    for (String hk : new ArrayList<String>(hiddenKeys)) {
+                        if (hk.startsWith(prefix)) hiddenKeys.remove(hk);
+                    }
+                }
+            }
+        } else {
+            hiddenKeys.add(item.key);
+        }
     }
 
     private void requestLauncherCatalog() {
@@ -681,11 +749,14 @@ public final class MainActivity extends Activity {
     }
 
     private void updateRailHeader() {
-        if (hmgApiConnected) {
-            lblConnSub.setText("● HMG-API Live");
+        if (hookOutdated) {
+            lblConnSub.setText("● Reboot Required · v1.0.1");
+            lblConnSub.setTextColor(WARN);
+        } else if (hmgApiConnected) {
+            lblConnSub.setText("● HMG-API Live · v1.0.1");
             lblConnSub.setTextColor(OK);
         } else {
-            lblConnSub.setText("● Local Provider Mode");
+            lblConnSub.setText("● Local Mode · v1.0.1");
             lblConnSub.setTextColor(ON_SURFACE_VAR);
         }
     }
@@ -697,7 +768,7 @@ public final class MainActivity extends Activity {
         for (TileWidgets.TileItem it : catalogItems) {
             if (it.isPackage()) totalPkg++;
             else totalSys++;
-            if (hiddenKeys.contains(it.key)) hiddenInCatalog++;
+            if (isItemHidden(it)) hiddenInCatalog++;
         }
         int totalHidden = Math.max(hiddenKeys.size(), hiddenInCatalog);
         if (totalAll > 0) {
@@ -730,8 +801,10 @@ public final class MainActivity extends Activity {
         List<TileWidgets.TileItem> filtered = new ArrayList<TileWidgets.TileItem>();
         Map<String, Integer> pkgCounts = new HashMap<String, Integer>();
         for (TileWidgets.TileItem it : catalogItems) {
-            Integer prev = pkgCounts.get(it.packageName);
-            pkgCounts.put(it.packageName, Integer.valueOf(prev == null ? 1 : prev.intValue() + 1));
+            if (!it.packageName.isEmpty()) {
+                Integer prev = pkgCounts.get(it.packageName);
+                pkgCounts.put(it.packageName, Integer.valueOf(prev == null ? 1 : prev.intValue() + 1));
+            }
             if (activeTab == TAB_PACKAGES && !it.isPackage()) continue;
             if (activeTab == TAB_SYSTEM && it.isPackage()) continue;
             filtered.add(it);
@@ -751,7 +824,8 @@ public final class MainActivity extends Activity {
             if (i > 0) rowLp.topMargin = d(9);
 
             TileWidgets.TileItem leftItem = filtered.get(i);
-            boolean leftMulti = pkgCounts.get(leftItem.packageName).intValue() > 1;
+            boolean leftMulti = !leftItem.packageName.isEmpty()
+                    && pkgCounts.get(leftItem.packageName).intValue() > 1;
             View leftCard = createCard(leftItem, leftMulti);
             LinearLayout.LayoutParams lpLeft = new LinearLayout.LayoutParams(
                     0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
@@ -760,7 +834,8 @@ public final class MainActivity extends Activity {
 
             if (i + 1 < filtered.size()) {
                 TileWidgets.TileItem rightItem = filtered.get(i + 1);
-                boolean rightMulti = pkgCounts.get(rightItem.packageName).intValue() > 1;
+                boolean rightMulti = !rightItem.packageName.isEmpty()
+                        && pkgCounts.get(rightItem.packageName).intValue() > 1;
                 View rightCard = createCard(rightItem, rightMulti);
                 LinearLayout.LayoutParams lpRight = new LinearLayout.LayoutParams(
                         0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
@@ -777,7 +852,7 @@ public final class MainActivity extends Activity {
     }
 
     private View createCard(final TileWidgets.TileItem item, boolean showSubClass) {
-        boolean vis = !hiddenKeys.contains(item.key);
+        boolean vis = !isItemHidden(item);
         final TileWidgets.TileCardView[] holder = new TileWidgets.TileCardView[1];
         TileWidgets.TileCardView card = new TileWidgets.TileCardView(
                 this, item, vis, showSubClass, new TileWidgets.ToggleListener() {
@@ -793,7 +868,7 @@ public final class MainActivity extends Activity {
     private void onTileVisibilityRequested(final TileWidgets.TileItem item, boolean visible,
                                            final TileWidgets.TileCardView card) {
         if (visible) {
-            hiddenKeys.remove(item.key);
+            setItemHiddenState(item, false);
             updateCountsAndBadges();
             persistAndBroadcast();
             return;
@@ -819,7 +894,7 @@ public final class MainActivity extends Activity {
                     .setPositiveButton("Hide Tile", new DialogInterface.OnClickListener() {
                         @Override
                         public void onClick(DialogInterface dialog, int which) {
-                            hiddenKeys.add(item.key);
+                            setItemHiddenState(item, true);
                             card.setTileVisible(false, false);
                             updateCountsAndBadges();
                             persistAndBroadcast();
@@ -829,23 +904,24 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        hiddenKeys.add(item.key);
+        setItemHiddenState(item, true);
         updateCountsAndBadges();
         persistAndBroadcast();
     }
 
     private static String safetyWarningFor(TileWidgets.TileItem item) {
-        String pkg = item.packageName;
+        String pkg = item.packageName == null ? "" : item.packageName;
+        String lowPkg = pkg.toLowerCase(Locale.US);
         if ("dev.lemoyne.tiles".equals(pkg)) {
             return "Hiding Tile Manager removes its shortcut from the Home Screen.\n\n"
-                    + "You can still open it anytime from NEMESIS Manager → Launch, or by assigning "
-                    + "\"Home Screen Tile Manager\" to the steering-wheel / dash ★ Custom button in HMG-API.";
+                    + "You can still open it anytime from Comfort → Home Screen Tiles, NEMESIS Manager → Launch, "
+                    + "or by assigning \"Home Screen Tile Manager\" to the ★ Custom button in HMG-API.";
         }
         if ("hmgapi.app".equals(pkg)) {
             return "Hiding HMG-API removes its tile from the Home Screen.\n\n"
                     + "Make sure you keep Tile Manager or NEMESIS Manager visible so you can re-enable it later.";
         }
-        if ("com.nemesis.manager".equals(pkg) || pkg.startsWith("com.nemesis.")) {
+        if (lowPkg.contains("nemesis") || lowPkg.contains("xwtk")) {
             return "Hiding NEMESIS removes its Home Screen shortcut.\n\n"
                     + "You can restore it anytime from Tile Manager → Packages & Mods.";
         }
@@ -913,12 +989,14 @@ public final class MainActivity extends Activity {
     // ---- Helpers ----
 
     private static String fallbackTitle(String pkg, String cls) {
-        if (cls != null && !cls.isEmpty()) {
+        String friendly = TileCatalogProvider.friendlyTitle("", pkg, cls);
+        if (!friendly.equals(pkg) && !"Home Tile".equals(friendly)) return friendly;
+        if (cls != null && !cls.isEmpty() && !"*".equals(cls)) {
             int dot = cls.lastIndexOf('.');
             if (dot >= 0 && dot + 1 < cls.length()) return cls.substring(dot + 1);
             return cls;
         }
-        return pkg;
+        return !pkg.isEmpty() ? pkg : friendly;
     }
 
     private static String joinKeys(Set<String> keys) {
