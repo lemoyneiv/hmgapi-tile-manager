@@ -1,0 +1,54 @@
+{
+  "id": "hmgapi-tile-manager",
+  "name": "Home Screen Tile Manager",
+  "version": "1.0.0",
+  "hmgapi": ">=1.0.0",
+  "authors": ["lemoyneiv"],
+  "license": "AGPL-3.0",
+  "repo": "https://github.com/lemoyneiv/hmgapi-tile-manager",
+  "description": "Show or hide stock system apps and mod packages on the Gen5W home screen and menu editor, compact empty grid gaps, and automatically back up and restore hidden tiles with live updates.",
+  "live": true,
+  "apps": [
+    {
+      "apk": "app/TileManager.apk",
+      "package": "dev.lemoyne.tiles"
+    }
+  ],
+  "hooks": {
+    "jar": "hooks.jar",
+    "entry": "dev.lemoyne.tiles.hook.TileModEntry",
+    "points": {
+      "launcher.menu_entry.new": "observe",
+      "launcher.menu_list.load": "observe",
+      "homesetting.edit_entry.new": "observe",
+      "homesetting.edit_list.load": "observe"
+    }
+  },
+  "provides": {
+    "launcher": [
+      {
+        "title": "Tile Manager",
+        "package": "dev.lemoyne.tiles",
+        "class": ".MainActivity",
+        "icon": "icons/icon.png",
+        "icon_night": "icons/icon_night.png",
+        "icon_disabled": "icons/icon_disabled.png",
+        "icon_disabled_night": "icons/icon_disabled_night.png"
+      }
+    ],
+    "star_key": [
+      {
+        "id": "open",
+        "title": "Home Screen Tile Manager",
+        "activity": {
+          "package": "dev.lemoyne.tiles",
+          "class": ".MainActivity"
+        }
+      }
+    ]
+  },
+  "logs": {
+    "tags": ["HmgTiles"],
+    "match": ["[hmgapi-tile-manager]"]
+  }
+}

@@ -1,0 +1,32 @@
+name: Car Compatibility / Bug Report
+description: Report how Home Screen Tile Manager works on your Gen5W vehicle or report an issue
+title: "[Car Report] "
+body:
+  - type: input
+    id: car
+    attributes:
+      label: Vehicle Year, Make, Model & Trim
+      placeholder: "2024 Hyundai Ioniq 5 Limited (US)"
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Infotainment Software Version
+      placeholder: "NEEV23.USA.0000.V016.010.260903"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Tile Manager & HMG-API Versions
+      placeholder: "Tile Manager 1.0.0, HMG-API 1.1.0-rc.3"
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What Worked / What Happened
+      description: Share which features you tested (hiding/restoring stock tiles, hiding/restoring mod tiles, gap compaction, Menu Editor filtering) and paste the Tile Manager log from HMG-API if reporting a bug.
+    validations:
+      required: true

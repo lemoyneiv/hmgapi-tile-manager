@@ -1,0 +1,159 @@
+# Build, test, sign, and publish a GitHub Release of hmgapi-tile-manager from a version tag (e.g. v1.0.0).
+# Uses repository secrets MOD_KEY, MOD_KEY_PUB, and optional APP_KEY_P12 (base64-encoded).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  MOD: hmgapi-tile-manager
+  AUTHOR_KEY: 28ad71e0-07c0-8e61-8bf3-380cc71f9280
+  HMGAPI_REPO: Open-HMG/HMG-API
+
+jobs:
+  check-secrets:
+    runs-on: ubuntu-24.04
+    outputs:
+      has_key: ${{ steps.k.outputs.has_key }}
+    steps:
+      - id: k
+        env:
+          MOD_KEY: ${{ secrets.MOD_KEY }}
+          MOD_KEY_PUB: ${{ secrets.MOD_KEY_PUB }}
+        run: |
+          if [ -n "$MOD_KEY" ] && [ -n "$MOD_KEY_PUB" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "No MOD_KEY secret configured; skipping automated CI release." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    needs: check-secrets
+    if: needs.check-secrets.outputs.has_key == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The tag matches mod.json version
+        run: |
+          v=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$MOD/mod.json")
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, but $MOD/mod.json's version is $v"; exit 1; }
+          echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$' || { echo "$v: expected semver"; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq clang lld zip unzip mksh
+
+      - name: Which SDK
+        id: pin
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          p = json.load(open("hmgapi-sdk.json"))
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          if set(p) == {"ref"} and re.fullmatch(r"[0-9a-f]{40}", p["ref"]):
+              out.write("form=ref\nref=%s\n" % p["ref"])
+          elif set(p) == {"version", "sha256"} and re.fullmatch(r"\d+\.\d+\.\d+(-(alpha|beta|rc)\.\d+)?", p["version"]) and re.fullmatch(r"[0-9a-f]{64}", p["sha256"]):
+              out.write("form=release\nversion=%s\nsha256=%s\n" % (p["version"], p["sha256"]))
+          else:
+              sys.exit('hmgapi-sdk.json: wanted {"ref": "<40 hex>"} or {"version": "x.y.z", "sha256": "<64 hex>"}')
+          PY
+
+      - name: HMG-API at the pinned commit
+        if: steps.pin.outputs.form == 'ref'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.HMGAPI_REPO }}
+          ref: ${{ steps.pin.outputs.ref }}
+          path: .hmgapi-src
+          persist-credentials: false
+
+      - name: The SDK
+        env:
+          FORM: ${{ steps.pin.outputs.form }}
+          SDK_VERSION: ${{ steps.pin.outputs.version }}
+          SHA256: ${{ steps.pin.outputs.sha256 }}
+        run: |
+          S="$RUNNER_TEMP/hmgapi-sdk"
+          if [ "$FORM" = ref ]; then
+            (cd .hmgapi-src && ./build.sh sdk)
+            Z=$(ls .hmgapi-src/out/dist/hmgapi-mod-sdk-*.zip)
+          else
+            Z="$RUNNER_TEMP/hmgapi-mod-sdk-$SDK_VERSION.zip"
+            curl -fsSL -o "$Z" "https://github.com/$HMGAPI_REPO/releases/download/v$SDK_VERSION/hmgapi-mod-sdk-$SDK_VERSION.zip"
+            echo "$SHA256  $Z" | sha256sum -c - || { echo "the SDK zip isn't the one hmgapi-sdk.json pins"; exit 1; }
+          fi
+          rm -rf "$S" && mkdir -p "$S" && unzip -q "$Z" -d "$S"
+          rm -rf .hmgapi-src
+          echo "HMGAPI_SDK=$S" >> "$GITHUB_ENV"
+          pip install --require-hashes -r "$S/requirements.txt"
+
+      - name: Build and sign installable packages
+        env:
+          MOD_KEY: ${{ secrets.MOD_KEY }}
+          MOD_KEY_PUB: ${{ secrets.MOD_KEY_PUB }}
+          APP_KEY_P12: ${{ secrets.APP_KEY_P12 }}
+        run: |
+          umask 077
+          k="$RUNNER_TEMP/keys"
+          mkdir -p "$k"
+          echo "$MOD_KEY" | base64 -d > "$k/author.key"
+          echo "$MOD_KEY_PUB" | base64 -d > "$k/author.key.pub"
+          if [ -n "$APP_KEY_P12" ]; then
+            echo "$APP_KEY_P12" | base64 -d > "$k/hmgapi-tile-manager-app.p12"
+            export HMGAPI_APP_KEY="$k/hmgapi-tile-manager-app.p12"
+          fi
+          UUID=$(java -cp "$HMGAPI_SDK/lib/hmgapi-engine.jar" hmgapi.engine.Signing uuid "$k/author.key.pub")
+          test "$UUID" = "$AUTHOR_KEY" || { echo "MOD_KEY is author key $UUID, not $AUTHOR_KEY"; exit 1; }
+          umask 022
+          HMGAPI_KEY="$k/author.key" sh ./build.sh
+          rm -rf "$k"
+
+      - name: Draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$MOD/mod.json")
+          notes="$RUNNER_TEMP/notes.md"
+          cat > "$notes" <<EOF
+          **$name $VERSION** for Hyundai, Kia & Genesis Gen5W head units (signed with author key \`$AUTHOR_KEY\`).
+
+          ### Downloads
+          - \`${MOD}-v${VERSION}-nemesis-usb.zip\` — Install from **NEMESIS** with a FAT32/exFAT USB drive
+          - \`${MOD}-v${VERSION}-hmgapi-usb.zip\` — Install from **HMG-API → Updates** with a FAT32/exFAT USB drive
+          - \`${MOD}-v${VERSION}-nemesis-package.zip\` — **NEMESIS Package Store** archive (\`hmgapi.${MOD}\`) or \`nemesis install\`
+          - \`${MOD}-v${VERSION}.zip\` — Signed HMG-API mod archive on its own
+
+          ### SHA-256 Checksums
+          \`\`\`text
+          $(cat dist/SHA256SUMS)
+          \`\`\`
+          EOF
+          sed -i 's/^          //' "$notes"
+          pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease --latest=false" ;; esac
+          gh release create "$GITHUB_REF_NAME" --draft $pre --title "$name $VERSION" --notes-file "$notes" dist/*.zip dist/SHA256SUMS
+
+      - name: Print HMG-API Catalogue Command
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/${MOD}-v${VERSION}.zip"
+          cmd="tools/catalog.py add ${MOD}-v${VERSION}.zip --download $url --repo https://github.com/$GITHUB_REPOSITORY"
+          echo "$cmd"
+          { echo "### HMG-API Catalogue"; echo; echo '```sh'; echo "$cmd"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

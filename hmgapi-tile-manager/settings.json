@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "settings": [
+    {
+      "key": "compact_gaps",
+      "type": "toggle",
+      "default": true,
+      "apply": "live",
+      "title": "Close empty gaps between tiles",
+      "description": "Automatically shifts remaining home screen tiles left to eliminate blank spaces when apps are hidden."
+    },
+    {
+      "key": "hidden_keys",
+      "type": "text",
+      "default": "",
+      "apply": "live",
+      "title": "Hidden tile keys",
+      "description": "Comma-separated package/activity keys hidden from the home screen and menu editor (managed visually in the Tile Manager app)."
+    }
+  ]
+}
