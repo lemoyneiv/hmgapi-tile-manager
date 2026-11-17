@@ -181,30 +181,30 @@ public final class TileStoreTest {
                 + "]}";
         TileStore.MenuInventory i5Inv = TileStore.collectMenuInventory(
                 Collections.singletonList(i5Menu), Collections.<String, Object>emptyMap());
-        Set<String> noHidden = Collections.emptySet();
+        Set<String> multiPkgs = setOf("com.android.settings");
 
         // Equipped stock tiles on this US Ioniq 5 MUST pass
         checkTrue("EV equipped", TileStore.isEquippedSystemTile(
-                "com.hkmc.ev/com.hkmc.ev.EvActivity", "com.hkmc.ev", ".EvActivity", i5Inv, noHidden));
+                "com.hkmc.ev/com.hkmc.ev.EvActivity", "com.hkmc.ev", ".EvActivity", i5Inv, multiPkgs));
         checkTrue("Navigation Menu (pkg-only) equipped", TileStore.isEquippedSystemTile(
-                "com.mnsoft.navi/com.mnsoft.navi.NaviMenuActivity", "com.mnsoft.navi", ".NaviMenuActivity", i5Inv, noHidden));
+                "com.mnsoft.navi/com.mnsoft.navi.NaviMenuActivity", "com.mnsoft.navi", ".NaviMenuActivity", i5Inv, multiPkgs));
         checkTrue("Hyundai Pay equipped", TileStore.isEquippedSystemTile(
-                "com.hkmc.carpay/com.hkmc.carpay.CarPayActivity", "com.hkmc.carpay", ".CarPayActivity", i5Inv, noHidden));
+                "com.hkmc.carpay/com.hkmc.carpay.CarPayActivity", "com.hkmc.carpay", ".CarPayActivity", i5Inv, multiPkgs));
         checkTrue("Radio (@class) equipped", TileStore.isEquippedSystemTile(
-                "@class/Radio", "", "Radio", i5Inv, noHidden));
+                "@class/Radio", "", "Radio", i5Inv, multiPkgs));
         checkTrue("Setup (com.android.settings.Settings) equipped", TileStore.isEquippedSystemTile(
-                "com.android.settings/com.android.settings.Settings", "com.android.settings", "com.android.settings.Settings", i5Inv, noHidden));
+                "com.android.settings/com.android.settings.Settings", "com.android.settings", "com.android.settings.Settings", i5Inv, multiPkgs));
 
         // Unequipped trim/region ghost entries MUST be excluded (including Memory Seat sharing com.android.settings!)
         check("Built-in Cam excluded", Boolean.FALSE, Boolean.valueOf(TileStore.isEquippedSystemTile(
-                "com.hkmc.dvrs/com.hkmc.dvrs.MainActivity", "com.hkmc.dvrs", ".MainActivity", i5Inv, noHidden)));
+                "com.hkmc.dvrs/com.hkmc.dvrs.MainActivity", "com.hkmc.dvrs", ".MainActivity", i5Inv, multiPkgs)));
         check("Memory Seat Configuration excluded despite sharing com.android.settings", Boolean.FALSE, Boolean.valueOf(
                 TileStore.isEquippedSystemTile("com.android.settings/com.android.settings.ImsSeatActivity",
-                        "com.android.settings", "com.android.settings.ImsSeatActivity", i5Inv, noHidden)));
+                        "com.android.settings", "com.android.settings.ImsSeatActivity", i5Inv, multiPkgs)));
         check("Sound Mood Lamp excluded", Boolean.FALSE, Boolean.valueOf(TileStore.isEquippedSystemTile(
-                "com.hkmc.moodlamp/com.hkmc.moodlamp.MoodLampActivity", "com.hkmc.moodlamp", ".MoodLampActivity", i5Inv, noHidden)));
+                "com.hkmc.moodlamp/com.hkmc.moodlamp.MoodLampActivity", "com.hkmc.moodlamp", ".MoodLampActivity", i5Inv, multiPkgs)));
         check("VIBE excluded", Boolean.FALSE, Boolean.valueOf(TileStore.isEquippedSystemTile(
-                "com.naver.vibe/com.naver.vibe.MainActivity", "com.naver.vibe", ".MainActivity", i5Inv, noHidden)));
+                "com.naver.vibe/com.naver.vibe.MainActivity", "com.naver.vibe", ".MainActivity", i5Inv, multiPkgs)));
 
         // 10. EntryInspector field calibration + extraction of 6-arg, 8-arg, custom-title, and itemId entries
         TileStore.EntryInspector inspector = new TileStore.EntryInspector();
@@ -225,23 +225,24 @@ public final class TileStoreTest {
 
         // 8-arg badge constructor (Notifications)
         MockQ notifEntry = MockQ.ctor8Badge("com.hkmc.notification", ".NoticeListActivity", 0x7f020010, 0x7f020011, 0x7f080021, 3);
-        TileStore.EntryInspector.Extracted exNotif = inspector.extract(notifEntry, i5Inv, noHidden, mockRes);
+        TileStore.EntryInspector.Extracted exNotif = inspector.extract(notifEntry, i5Inv, Collections.<String>emptySet(), mockRes);
         check("8-arg Notifications pkg", "com.hkmc.notification", exNotif.pkg);
         check("8-arg Notifications cls", ".NoticeListActivity", exNotif.cls);
         check("8-arg Notifications titleId", Integer.valueOf(0x7f080021), Integer.valueOf(exNotif.titleId));
 
         // 6-arg package-only constructor (Navigation Menu)
         MockQ naviEntry = MockQ.ctor6PkgOnly("com.mnsoft.navi", 0x7f020012, 0x7f020013, 0x7f080022);
-        TileStore.EntryInspector.Extracted exNavi = inspector.extract(naviEntry, i5Inv, noHidden, mockRes);
+        TileStore.EntryInspector.Extracted exNavi = inspector.extract(naviEntry, i5Inv, Collections.<String>emptySet(), mockRes);
         check("6-arg Navigation Menu pkg", "com.mnsoft.navi", exNavi.pkg);
         check("6-arg Navigation Menu key", "com.mnsoft.navi/*", TileStore.normKey(exNavi.pkg, exNavi.cls));
 
         // Custom/NEMESIS direct-title constructor (titleId = 0)
         MockQ nemesisEntry = MockQ.ctorCustomLabel("com.nemesis.manager", "com.nemesis.manager.MainActivity", "NEMESIS Manager");
-        TileStore.EntryInspector.Extracted exNem = inspector.extract(nemesisEntry, i5Inv, noHidden, mockRes);
+        TileStore.EntryInspector.Extracted exNem = inspector.extract(nemesisEntry, i5Inv, Collections.<String>emptySet(), mockRes);
         check("Custom label pkg", "com.nemesis.manager", exNem.pkg);
         check("Custom label titleText", "NEMESIS Manager", exNem.titleText);
-        check("NEMESIS package classified non-stock", Boolean.FALSE, Boolean.valueOf(TileStore.isStockOemPackage(exNem.pkg)));
+        check("NEMESIS package classified as package", "package",
+                TileStore.classifyTileKind(exNem.pkg, exNem.titleText, 0, -1, false, "nemesis"));
 
         // Friendly fallback titles for technical APK labels
         check("QRManual -> User's Manual", "User's Manual",
@@ -320,6 +321,83 @@ public final class TileStoreTest {
         check("readHmgApiLauncherMods finds only enabled mod", Integer.valueOf(1), Integer.valueOf(specs.size()));
         check("readHmgApiLauncherMods expands shorthand class", "dev.lemoyne.comfort/dev.lemoyne.comfort.MainActivity", specs.get(0).key);
         check("readHmgApiLauncherMods reads title", "Comfort", specs.get(0).title);
+
+        // 14. v1.0.2 regressions: OEM /system/app classification regardless of vendor package prefix
+        //     (Hyundai Pay, Notifications, Valet Mode, Phone Projection) vs custom /data/app & mods
+        check("Hyundai Pay (non-hkmc /system/app) is system", "system",
+                TileStore.classifyTileKind("com.hmc.carpay", "Hyundai Pay", 0x7f080050, 5, false, null));
+        check("Notifications (non-hkmc /system/app) is system", "system",
+                TileStore.classifyTileKind("com.ivi.notification.center", "Notifications", 0x7f080051, 12, false, null));
+        check("Valet Mode (non-hkmc /system/app) is system", "system",
+                TileStore.classifyTileKind("com.hmc.valetmode", "Valet Mode", 0x7f080052, 16, false, null));
+        check("Phone Projection (non-hkmc /system/app) is system", "system",
+                TileStore.classifyTileKind("com.connectivity.projection", "Phone Projection", 0x7f080053, 6, false, null));
+        check("Sideloaded /data/app APK is package", "package",
+                TileStore.classifyTileKind("org.videolan.vlc", "VLC", 0, -1, true, null));
+        check("HMG-API mod with 0x7f7e0000 titleId is package", "package",
+                TileStore.classifyTileKind("dev.lemoyne.comfort", "Comfort", 0x7f7e0003, -1, true, "hmgapi-comfort"));
+        check("HMG-API core app is package", "package",
+                TileStore.classifyTileKind("hmgapi.app", "HMG-API", 0, 9000, true, "hmgapi"));
+
+        // 15. v1.0.2 regressions: Gen5wFacts hardware/region feature gate + multi-entry Settings wildcard guard
+        File permDir = new File(tmpDir, "permissions");
+        permDir.mkdirs();
+        TileStore.writeAtomic(new File(permDir, "car.xml"),
+                "<permissions><feature name=\"com.hkmc.software.carpay\"/><feature name=\"android.hardware.location\"/></permissions>");
+        Set<String> parsedFeats = TileStore.readPermissionXmlFeatures(permDir);
+        checkTrue("readPermissionXmlFeatures parses carpay", parsedFeats.contains("com.hkmc.software.carpay"));
+
+        TileStore.Gen5wFacts usIoniq5Se = new TileStore.Gen5wFacts(
+                "NEEV23SE.USA.260903", 1, parsedFeats, null, null, null);
+        check("US Ioniq 5 SE excludes VIBE", Boolean.FALSE,
+                Boolean.valueOf(TileStore.isSupportedStockFeature("VIBE", "com.naver.vibe", ".MainActivity", usIoniq5Se)));
+        check("US Ioniq 5 SE excludes Built-in Cam", Boolean.FALSE,
+                Boolean.valueOf(TileStore.isSupportedStockFeature("Built-in Cam", "com.hkmc.dvrs", ".DvrsActivity", usIoniq5Se)));
+        check("US Ioniq 5 SE excludes Sound Mood Lamp", Boolean.FALSE,
+                Boolean.valueOf(TileStore.isSupportedStockFeature("Sound Mood Lamp", "com.android.settings", ".SoundMoodLampActivity", usIoniq5Se)));
+        check("US Ioniq 5 SE excludes Memory Seat Configuration", Boolean.FALSE,
+                Boolean.valueOf(TileStore.isSupportedStockFeature("Memory Seat Configuration", "com.android.settings", ".ImsSeatActivity", usIoniq5Se)));
+
+        // All real stock tiles on US Ioniq 5 SE MUST pass Gen5wFacts
+        for (String[] real : new String[][] {
+                { "EV", "com.hkmc.ev", ".EvActivity" },
+                { "Navigation Menu", "com.mnsoft.navi", "" },
+                { "Hyundai Pay", "com.hmc.carpay", ".CarPayActivity" },
+                { "Radio", "", "Radio" },
+                { "Bluelink", "com.hkmc.telematics.bluelink", ".Main" },
+                { "Notifications", "com.ivi.notification", ".NoticeActivity" },
+                { "User's Manual", "com.hkmc.qrmanual", "" },
+                { "Valet Mode", "com.hmc.valetmode", ".ValetActivity" },
+                { "Phone Projection", "com.connectivity.projection", ".MainActivity" },
+                { "Quiet Mode", "com.hkmc.quietmode", ".QuietActivity" },
+                { "Setup", "com.android.settings", "com.android.settings.Settings" }
+        }) {
+            checkTrue("US Ioniq 5 SE keeps real stock tile " + real[0],
+                    TileStore.isSupportedStockFeature(real[0], real[1], real[2], usIoniq5Se));
+        }
+
+        // Equipped trims/regions DO keep their supported features
+        TileStore.Gen5wFacts korCarWithIms = new TileStore.Gen5wFacts(
+                "NEEV23.KOR.260903", 0, setOf("com.hkmc.software.ims"), Integer.valueOf(1), Integer.valueOf(1), Integer.valueOf(1));
+        checkTrue("KOR car keeps VIBE", TileStore.isSupportedStockFeature("VIBE", "com.naver.vibe", ".MainActivity", korCarWithIms));
+        checkTrue("KOR car with DVRS keeps Built-in Cam", TileStore.isSupportedStockFeature("Built-in Cam", "com.hkmc.dvrs", ".DvrsActivity", korCarWithIms));
+        checkTrue("IMS option=1 keeps Memory Seat Configuration", TileStore.isSupportedStockFeature("Memory Seat Configuration", "com.android.settings", ".ImsSeatActivity", korCarWithIms));
+        checkTrue("SML option=1 keeps Sound Mood Lamp", TileStore.isSupportedStockFeature("Sound Mood Lamp", "com.hkmc.sml", ".SmlActivity", korCarWithIms));
+
+        // Even if com.android.settings/* is in equippedKeys, sub-screens like Memory Seat do NOT false-match, while Setup DOES!
+        String pkgOnlySettingsMenu = "{\"menuItems\":[{\"packageName\":\"com.android.settings\",\"itemId\":20,\"className\":\"\"}]}";
+        TileStore.MenuInventory pkgOnlySettingsInv = TileStore.collectMenuInventory(
+                Collections.singletonList(pkgOnlySettingsMenu), bootBackups);
+        check("com.android.settings/* does NOT false-match Memory Seat sub-activity", Boolean.FALSE, Boolean.valueOf(
+                TileStore.isEquippedSystemTile("com.android.settings/com.android.settings.ImsSeatActivity",
+                        "com.android.settings", "com.android.settings.ImsSeatActivity", pkgOnlySettingsInv, multiPkgs)));
+        checkTrue("com.android.settings/* still keeps main Setup activity",
+                TileStore.isEquippedSystemTile("com.android.settings/com.android.settings.Settings",
+                        "com.android.settings", "com.android.settings.Settings", pkgOnlySettingsInv, multiPkgs));
+        // Real hidden Radio backed up in bootBackups stays equipped even when absent from active menuItems!
+        checkTrue("Backed-up hidden Radio stays equipped",
+                TileStore.isEquippedSystemTile("com.hkmc.radio/com.hkmc.radio.RadioActivity",
+                        "com.hkmc.radio", "com.hkmc.radio.RadioActivity", pkgOnlySettingsInv, multiPkgs));
 
         System.out.println("TileStoreTest: " + checks + " checks passed");
     }

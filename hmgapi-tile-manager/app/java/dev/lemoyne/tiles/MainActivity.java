@@ -571,34 +571,38 @@ public final class MainActivity extends Activity {
             } catch (Throwable ignored) {}
         }
 
-        // Also surface any hidden keys not yet in catalog so the user can always unhide them
-        for (String hk : loadedHidden) {
-            if (seenKeys.contains(hk) || matchesExistingCatalogItem(items, hk)) continue;
-            int slash = hk.indexOf('/');
-            if (slash <= 0) continue;
-            String left = hk.substring(0, slash);
-            String right = hk.substring(slash + 1);
-            String pkg;
-            String cls;
-            String title;
-            String kind;
-            if ("@class".equals(left)) {
-                pkg = "";
-                cls = right;
-                title = fallbackTitle("", cls);
-                kind = "system";
-            } else if ("@item".equals(left)) {
-                pkg = "";
-                cls = "";
-                title = "Saved Tile #" + right;
-                kind = "system";
-            } else {
-                pkg = left;
-                cls = right;
-                title = fallbackTitle(pkg, cls);
-                kind = TileCatalogProvider.isStockPackage(pkg) ? "system" : "package";
+        // Only synthesize fallback cards from loadedHidden if catalog has not been populated yet;
+        // when the catalog is present, it already includes all equipped & backed-up hidden tiles,
+        // so skipping unmatched keys prevents stale ghost entries from reappearing as orphan cards.
+        if (items.isEmpty()) {
+            for (String hk : loadedHidden) {
+                if (seenKeys.contains(hk) || matchesExistingCatalogItem(items, hk)) continue;
+                int slash = hk.indexOf('/');
+                if (slash <= 0) continue;
+                String left = hk.substring(0, slash);
+                String right = hk.substring(slash + 1);
+                String pkg;
+                String cls;
+                String title;
+                String kind;
+                if ("@class".equals(left)) {
+                    pkg = "";
+                    cls = right;
+                    title = fallbackTitle("", cls);
+                    kind = "system";
+                } else if ("@item".equals(left)) {
+                    pkg = "";
+                    cls = "";
+                    title = "Saved Tile #" + right;
+                    kind = "system";
+                } else {
+                    pkg = left;
+                    cls = right;
+                    title = fallbackTitle(pkg, cls);
+                    kind = TileCatalogProvider.classifyKind(this, pkg, title, -1, null);
+                }
+                items.add(new TileWidgets.TileItem(hk, pkg, cls, title, kind, null, true));
             }
-            items.add(new TileWidgets.TileItem(hk, pkg, cls, title, kind, null, true));
         }
 
         Collections.sort(items, new Comparator<TileWidgets.TileItem>() {
@@ -677,7 +681,15 @@ public final class MainActivity extends Activity {
 
     private void persistAndBroadcast() {
         final boolean snapCompact = compactGaps;
-        final Set<String> snapHidden = new LinkedHashSet<String>(hiddenKeys);
+        final Set<String> snapHidden = new LinkedHashSet<String>();
+        for (String hk : hiddenKeys) {
+            if (catalogItems.isEmpty() || matchesExistingCatalogItem(catalogItems, hk)
+                    || !TileCatalogProvider.isGhostSystemKey(this, hk)) {
+                snapHidden.add(hk);
+            }
+        }
+        hiddenKeys.clear();
+        hiddenKeys.addAll(snapHidden);
         final int gen = ++saveGeneration;
 
         lblSaveStatus.setText("Applying live…");
@@ -750,13 +762,13 @@ public final class MainActivity extends Activity {
 
     private void updateRailHeader() {
         if (hookOutdated) {
-            lblConnSub.setText("● Reboot Required · v1.0.1");
+            lblConnSub.setText("● Reboot Required · v1.0.2");
             lblConnSub.setTextColor(WARN);
         } else if (hmgApiConnected) {
-            lblConnSub.setText("● HMG-API Live · v1.0.1");
+            lblConnSub.setText("● HMG-API Live · v1.0.2");
             lblConnSub.setTextColor(OK);
         } else {
-            lblConnSub.setText("● Local Mode · v1.0.1");
+            lblConnSub.setText("● Local Mode · v1.0.2");
             lblConnSub.setTextColor(ON_SURFACE_VAR);
         }
     }
@@ -770,7 +782,7 @@ public final class MainActivity extends Activity {
             else totalSys++;
             if (isItemHidden(it)) hiddenInCatalog++;
         }
-        int totalHidden = Math.max(hiddenKeys.size(), hiddenInCatalog);
+        int totalHidden = totalAll > 0 ? hiddenInCatalog : hiddenKeys.size();
         if (totalAll > 0) {
             int vis = Math.max(0, totalAll - hiddenInCatalog);
             lblHeroCount.setText(vis + " / " + totalAll + " Visible");

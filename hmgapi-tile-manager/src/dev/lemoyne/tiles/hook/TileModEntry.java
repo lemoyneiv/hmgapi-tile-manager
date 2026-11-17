@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.FeatureInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.database.Cursor;
@@ -23,6 +24,8 @@ import hmgapi.hook.Points;
 
 import java.io.File;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -40,8 +43,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *  - com.android.launcher3: inspects all menu entries (7-arg + overloaded constructors), wraps
  *    launcher.menu_list.items in FilterableMenuList so mod/custom tiles added later by HMG-API's
  *    LIFO afterHookedMethod or NEMESIS are captured and filtered, excludes unequipped trim/region
- *    ghost stock tiles via all_menu, pushes the schema-2 catalog to TileCatalogProvider, and
- *    synchronises all_menu with exact itemId/slot backup & optional gap compaction.
+ *    ghost stock tiles via PackageManager + Gen5wFacts + all_menu, pushes the schema-3 catalog to
+ *    TileCatalogProvider, and synchronises all_menu with exact itemId/slot backup & gap compaction.
  *  - com.hkmc.system.app.homesetting: wraps homesetting.edit_list.items in FilterableMenuList so
  *    both stock and mod/custom hidden tiles stay hidden in Edit Home Icons and update live.
  */
@@ -53,6 +56,7 @@ public final class TileModEntry extends ModEntry {
     static final Uri CATALOG_URI = Uri.parse("content://" + TileStore.PROVIDER_AUTH);
     static final File PUBLIC_STATE = new File("/data/hmgapi/public/state.json");
     static final File MODS_ROOT = new File("/data/hmgapi/mods");
+    static final File PERMISSIONS_DIR = new File("/system/etc/permissions");
 
     static final class EntryMeta {
         final String key;
@@ -87,6 +91,7 @@ public final class TileModEntry extends ModEntry {
     private static volatile boolean editorReceiverStarted;
     private static volatile String lastCatalogJson;
     private static volatile String lastAppliedSignature;
+    private static volatile TileStore.Gen5wFacts cachedFacts;
 
     private static volatile TileStore.FilterableMenuList liveLauncherList;
     private static volatile Object liveLauncherLock;
@@ -135,7 +140,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("launcher tile manager v1.0.1 active in " + app.processName);
+        mod.log("launcher tile manager v1.0.2 active in " + app.processName);
     }
 
     private void hookEditor(final ModContext mod, final LoadedApp app) {
@@ -170,7 +175,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("menu editor tile manager v1.0.1 active in " + app.processName);
+        mod.log("menu editor tile manager v1.0.2 active in " + app.processName);
     }
 
     private static void hookEntryCtor(final ModContext mod, ClassLoader cl, String pointId,
@@ -319,7 +324,7 @@ public final class TileModEntry extends ModEntry {
                     } catch (Throwable ignored) {}
                 }
                 ApplicationInfo appInfo = pm.getApplicationInfo(pkg, 0);
-                if ((appInfo.flags & ApplicationInfo.FLAG_SYSTEM) == 0) {
+                if ((appInfo.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) == 0) {
                     isUserPkg = true;
                 }
                 if (title == null || title.trim().isEmpty()) {
@@ -332,7 +337,6 @@ public final class TileModEntry extends ModEntry {
         if (title == null) title = "";
         title = title.replace('\n', ' ').replace('\r', ' ').replaceAll(" +", " ").trim();
 
-        boolean isHmgRes = (titleId & 0xffff0000) == 0x7f7e0000;
         boolean isHmgApp = "hmgapi.app".equals(pkg) || pkg.startsWith("hmgapi.");
         String lowPkg = pkg.toLowerCase(Locale.US);
         boolean isNemesis = lowPkg.contains("nemesis") || lowPkg.contains("xwtk")
@@ -345,9 +349,7 @@ public final class TileModEntry extends ModEntry {
             else if (isNemesis) modId = "nemesis";
         }
 
-        boolean nonStockPkg = !pkg.isEmpty() && !TileStore.isStockOemPackage(pkg);
-        String kind = (isHmgRes || isHmgApp || isNemesis || isUserPkg || modId != null
-                || nonStockPkg || itemId >= 9000) ? "package" : "system";
+        String kind = TileStore.classifyTileKind(pkg, title, titleId, itemId, isUserPkg, modId);
 
         if ("hmgapi".equals(modId) && (title.isEmpty() || title.equals(pkg))) {
             title = "HMG-API";
@@ -523,20 +525,52 @@ public final class TileModEntry extends ModEntry {
         Map<String, Map<String, Object>> catalogByKey = new LinkedHashMap<String, Map<String, Object>>();
         Set<String> coveredPackages = new LinkedHashSet<String>();
         Set<String> matchedKeys = new LinkedHashSet<String>();
+        Set<String> rejectedKeys = new LinkedHashSet<String>();
         preSeedMatchedKeys(rawItems, matchedKeys);
 
-        // 1. Entries from Launcher_WP3's menu list (stock 7-arg + overloaded ctors + HMG-API mods + NEMESIS)
+        List<Object> extractedItems = new ArrayList<Object>();
+        List<EntryMeta> extractedMetas = new ArrayList<EntryMeta>();
+        Map<String, Set<String>> keysByPkg = new LinkedHashMap<String, Set<String>>();
         if (rawItems != null) {
             for (Object item : rawItems) {
                 EntryMeta m = ensureMeta(ctx, item, launcherInspector, inv, matchedKeys, null);
                 if (m == null || m.key.isEmpty()) continue;
                 matchedKeys.add(m.key);
-                if ("system".equals(m.kind)
-                        && !TileStore.isEquippedSystemTile(m.key, m.pkg, m.cls, inv, cfg.hidden)) {
-                    continue; // Exclude unequipped trim/region ghost stock definitions (Built-in Cam, VIBE, etc.)
+                extractedItems.add(item);
+                extractedMetas.add(m);
+                if (!m.pkg.isEmpty()) {
+                    Set<String> ks = keysByPkg.get(m.pkg);
+                    if (ks == null) {
+                        ks = new LinkedHashSet<String>();
+                        keysByPkg.put(m.pkg, ks);
+                    }
+                    ks.add(m.key);
                 }
-                putCatalogRow(catalogByKey, coveredPackages, m);
             }
+        }
+
+        Set<String> multiEntryPackages = new LinkedHashSet<String>();
+        multiEntryPackages.add("com.android.settings");
+        for (Map.Entry<String, Set<String>> pe : keysByPkg.entrySet()) {
+            if (pe.getValue().size() > 1) multiEntryPackages.add(pe.getKey());
+        }
+
+        TileStore.Gen5wFacts facts = getGen5wFacts(ctx);
+
+        // 1. Entries from Launcher_WP3's menu list (stock 7-arg + overloaded ctors + HMG-API mods + NEMESIS)
+        for (int i = 0; i < extractedMetas.size(); i++) {
+            Object item = extractedItems.get(i);
+            EntryMeta m = extractedMetas.get(i);
+            if ("system".equals(m.kind)) {
+                if (isEntryExplicitlyUnsupported(item)
+                        || !isTargetComponentInstalled(ctx, m.pkg, m.cls)
+                        || !TileStore.isSupportedStockFeature(m.title, m.pkg, m.cls, facts)
+                        || !TileStore.isEquippedSystemTile(m.key, m.pkg, m.cls, inv, multiEntryPackages)) {
+                    rejectedKeys.add(m.key);
+                    continue;
+                }
+            }
+            putCatalogRow(catalogByKey, coveredPackages, m);
         }
 
         // 2. HMG-API's own app + all enabled mods' provides.launcher entries (ensures 100% custom mod
@@ -554,19 +588,29 @@ public final class TileModEntry extends ModEntry {
             putCatalogRow(catalogByKey, coveredPackages, m);
         }
 
-        // 3. Any active or backed-up tile in all_menu that wasn't already represented above
+        // 3. Custom/mod entries in all_menu (or bootstrap stock entries if Launcher_WP3 rawItems is empty)
+        boolean hasLauncherItems = !extractedMetas.isEmpty();
         if (inv != null) {
             for (TileStore.MenuEntryRecord rec : inv.activeEntries) {
-                if (catalogByKey.containsKey(rec.key)) continue;
+                if (catalogByKey.containsKey(rec.key) || rejectedKeys.contains(rec.key)) continue;
                 if (!rec.packageName.isEmpty() && catalogByKey.containsKey(rec.packageName + "/*")) continue;
                 if (("*".equals(rec.className) || rec.className.isEmpty())
                         && !rec.packageName.isEmpty() && coveredPackages.contains(rec.packageName)) {
                     continue;
                 }
                 EntryMeta m = buildMeta(ctx, rec.packageName, rec.className, 0, null, rec.itemId);
-                if (!m.key.isEmpty() && !catalogByKey.containsKey(m.key)) {
-                    putCatalogRow(catalogByKey, coveredPackages, m);
+                if (m.key.isEmpty() || catalogByKey.containsKey(m.key) || rejectedKeys.contains(m.key)) continue;
+                if ("system".equals(m.kind)) {
+                    // Launcher_WP3 drops any saved stock entry not in menu_list.items; never re-insert
+                    // skipped or unequipped stock items from all_menu.
+                    if (hasLauncherItems) continue;
+                    if (!isTargetComponentInstalled(ctx, m.pkg, m.cls)
+                            || !TileStore.isSupportedStockFeature(m.title, m.pkg, m.cls, facts)
+                            || !TileStore.isEquippedSystemTile(m.key, m.pkg, m.cls, inv, multiEntryPackages)) {
+                        continue;
+                    }
                 }
+                putCatalogRow(catalogByKey, coveredPackages, m);
             }
         }
 
@@ -580,8 +624,6 @@ public final class TileModEntry extends ModEntry {
     private static void putCatalogRow(Map<String, Map<String, Object>> catalogByKey,
                                       Set<String> coveredPackages, EntryMeta m) {
         if (catalogByKey.containsKey(m.key)) return;
-        // If we previously added a package wildcard pkg/* and now have a specific pkg/cls, or vice versa,
-        // avoid duplicate entries for the same single-tile stock package.
         if (!m.pkg.isEmpty()) {
             String wildcard = m.pkg + "/*";
             if (!m.key.equals(wildcard) && catalogByKey.containsKey(wildcard)) {
@@ -609,6 +651,153 @@ public final class TileModEntry extends ModEntry {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private static boolean isTargetComponentInstalled(Context ctx, String pkg, String cls) {
+        String p = TileStore.cleanToken(pkg);
+        if (ctx == null || p.isEmpty()) return true;
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            ApplicationInfo ai = pm.getApplicationInfo(p, 0);
+            if (!ai.enabled) return false;
+            try {
+                int appState = pm.getApplicationEnabledSetting(p);
+                if (appState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED || appState == 3) {
+                    return false;
+                }
+            } catch (Throwable ignored) {}
+
+            String fullCls = TileStore.expandClass(p, cls);
+            if (!fullCls.isEmpty() && !"*".equals(fullCls) && fullCls.indexOf('.') > 0) {
+                ComponentName cn = new ComponentName(p, fullCls);
+                try {
+                    int compState = pm.getComponentEnabledSetting(cn);
+                    if (compState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED || compState == 3) {
+                        return false;
+                    }
+                } catch (Throwable ignored) {}
+                try {
+                    ActivityInfo act = pm.getActivityInfo(cn, 0);
+                    if (!act.enabled) return false;
+                } catch (PackageManager.NameNotFoundException nf) {
+                    if ("com.android.settings".equals(p)) return false;
+                }
+            }
+            return true;
+        } catch (PackageManager.NameNotFoundException nf) {
+            return false;
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private static boolean isEntryExplicitlyUnsupported(Object item) {
+        if (item == null) return false;
+        String[] methods = new String[] { "isSupport", "isSupported", "isAvailable", "isEnableMenu" };
+        for (Class<?> cur = item.getClass(); cur != null && cur != Object.class; cur = cur.getSuperclass()) {
+            for (String name : methods) {
+                try {
+                    Method m = cur.getDeclaredMethod(name);
+                    if (Modifier.isStatic(m.getModifiers())) continue;
+                    Class<?> rt = m.getReturnType();
+                    if (rt != boolean.class && rt != Boolean.class) continue;
+                    m.setAccessible(true);
+                    Object v = m.invoke(item);
+                    if (Boolean.FALSE.equals(v)) return true;
+                } catch (NoSuchMethodException ignored) {
+                } catch (Throwable ignored) {}
+            }
+        }
+        return false;
+    }
+
+    private static TileStore.Gen5wFacts getGen5wFacts(Context ctx) {
+        TileStore.Gen5wFacts existing = cachedFacts;
+        if (existing != null) return existing;
+        String product = readSysProp("ro.build.product");
+        if (product.isEmpty()) product = readSysProp("ro.product.name");
+        int regionCode = readBuildInfoRegion();
+        Set<String> feats = TileStore.readPermissionXmlFeatures(PERMISSIONS_DIR);
+        if (ctx != null) {
+            try {
+                FeatureInfo[] avail = ctx.getPackageManager().getSystemAvailableFeatures();
+                if (avail != null) {
+                    for (FeatureInfo fi : avail) {
+                        if (fi != null && fi.name != null && !fi.name.trim().isEmpty()) {
+                            feats.add(fi.name.trim().toLowerCase(Locale.US));
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        Integer imsOpt = probeServiceOption("memoryseat", "seatmemory", "ims");
+        Integer smlOpt = probeServiceOption("soundmood", "moodlamp", "sml");
+        Integer dvrsOpt = probeServiceOption("dvrs", "builtincam");
+        TileStore.Gen5wFacts built = new TileStore.Gen5wFacts(product, regionCode, feats, imsOpt, smlOpt, dvrsOpt);
+        cachedFacts = built;
+        return built;
+    }
+
+    private static String readSysProp(String key) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Method m = sp.getMethod("get", String.class, String.class);
+            Object v = m.invoke(null, key, "");
+            return v != null ? TileStore.cleanToken(v) : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static int readBuildInfoRegion() {
+        try {
+            Class<?> bi = Class.forName("com.hkmc.BuildInfo");
+            Field f = bi.getField("REGION");
+            Object v = f.get(null);
+            if (v instanceof Number) return ((Number) v).intValue();
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private static Integer probeServiceOption(String... tokens) {
+        String[][] services = new String[][] {
+            { "usm", "com.hkmc.usm.IUSMService$Stub" },
+            { "system_service", "com.hkmc.system.ISystemService$Stub" },
+            { "bcm", "com.hkmc.bcm.IBCMService$Stub" }
+        };
+        try {
+            Class<?> sm = Class.forName("android.os.ServiceManager");
+            Method getSvc = sm.getMethod("getService", String.class);
+            Class<?> ibinder = Class.forName("android.os.IBinder");
+            for (String[] pair : services) {
+                try {
+                    Object binder = getSvc.invoke(null, pair[0]);
+                    if (binder == null) continue;
+                    Class<?> stub = Class.forName(pair[1]);
+                    Object iface = stub.getMethod("asInterface", ibinder).invoke(null, binder);
+                    if (iface == null) continue;
+                    for (Method m : iface.getClass().getMethods()) {
+                        if (m.getParameterTypes().length != 0 || Modifier.isStatic(m.getModifiers())) continue;
+                        Class<?> rt = m.getReturnType();
+                        if (rt != boolean.class && rt != Boolean.class && rt != int.class && rt != Integer.class) {
+                            continue;
+                        }
+                        String low = m.getName().toLowerCase(Locale.US);
+                        if (!(low.startsWith("issupport") || (low.startsWith("get") && low.endsWith("option")))) {
+                            continue;
+                        }
+                        for (String tok : tokens) {
+                            if (low.contains(tok)) {
+                                Object res = m.invoke(iface);
+                                if (res instanceof Boolean) return Integer.valueOf(((Boolean) res).booleanValue() ? 1 : 0);
+                                if (res instanceof Number) return Integer.valueOf(((Number) res).intValue());
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private static void pushCatalogSync(Context ctx, String catJson) {
@@ -826,23 +1015,36 @@ public final class TileModEntry extends ModEntry {
         if (ctx == null) {
             return TileStore.collectMenuInventory(Collections.<String>emptyList(), null);
         }
-        List<String> profileJsons = new ArrayList<String>();
+        List<String> driver1Jsons = new ArrayList<String>();
+        List<String> nonGuestJsons = new ArrayList<String>();
+        List<String> allJsons = new ArrayList<String>();
         Map<String, Object> backups = readBackupsMap(ctx);
         Cursor cur = null;
         try {
             cur = ctx.getContentResolver().query(ALL_MENU, null, null, null, null);
             if (cur != null) {
+                int userCol = cur.getColumnIndex("userName");
                 int itemsCol = cur.getColumnIndex("menu_items");
                 while (cur.moveToNext()) {
+                    String user = userCol >= 0 ? TileStore.cleanToken(cur.getString(userCol)) : "";
                     String json = itemsCol >= 0 ? cur.getString(itemsCol) : null;
-                    if (json != null && !json.isEmpty()) profileJsons.add(json);
+                    if (json == null || json.isEmpty()) continue;
+                    allJsons.add(json);
+                    if ("Driver 1".equalsIgnoreCase(user)) {
+                        driver1Jsons.add(json);
+                    }
+                    if (!"Guest".equalsIgnoreCase(user)) {
+                        nonGuestJsons.add(json);
+                    }
                 }
             }
         } catch (Throwable ignored) {
         } finally {
             if (cur != null) cur.close();
         }
-        return TileStore.collectMenuInventory(profileJsons, backups);
+        List<String> chosen = !driver1Jsons.isEmpty() ? driver1Jsons
+                : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons);
+        return TileStore.collectMenuInventory(chosen, backups);
     }
 
     private static Map<String, Object> readBackupsMap(Context ctx) {

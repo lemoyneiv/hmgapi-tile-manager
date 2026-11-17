@@ -969,20 +969,210 @@ public final class TileStore {
     }
 
     /**
+     * Classifies a launcher/editor entry as "package" (Packages & Mods) or "system" (System Apps).
+     * All OEM /system/app packages (including Hyundai Pay, Notifications, Valet Mode, and Phone
+     * Projection regardless of OEM vendor package prefix) have FLAG_SYSTEM set and classify as
+     * "system" unless registered as an HMG-API mod, HMG-API app, or NEMESIS shortcut. All
+     * user-installed /data/app APKs (isUserInstalledApp=true) classify as "package".
+     */
+    public static String classifyTileKind(String pkg, String title, int titleId, int itemId,
+                                          boolean isUserInstalledApp, String modId) {
+        String p = cleanToken(pkg);
+        String lowPkg = p.toLowerCase(Locale.US);
+        String upTitle = title == null ? "" : title.toUpperCase(Locale.US);
+        boolean isHmgRes = (titleId & 0xffff0000) == 0x7f7e0000;
+        boolean isHmgApp = "hmgapi.app".equals(p) || p.startsWith("hmgapi.");
+        boolean isNemesis = lowPkg.contains("nemesis") || lowPkg.contains("xwtk")
+                || upTitle.contains("NEMESIS") || itemId == 90;
+        boolean hasMod = modId != null && !modId.trim().isEmpty();
+        return (isHmgRes || isHmgApp || isNemesis || isUserInstalledApp || hasMod || itemId >= 9000)
+                ? "package" : "system";
+    }
+
+    /**
+     * Vehicle trim, region, and declared /system/etc/permissions feature snapshot used to filter
+     * optional stock definitions compiled into shared onebin Gen5W system images (e.g. VIBE,
+     * Built-in Cam, Sound Mood Lamp, and Memory Seat Configuration on trims/regions without them).
+     */
+    public static final class Gen5wFacts {
+        public final String product;
+        public final String model;
+        public final String region;
+        public final int buildInfoRegion;
+        public final Set<String> features;
+        public final Integer imsOption;
+        public final Integer smlOption;
+        public final Integer dvrsOption;
+
+        public Gen5wFacts(String product, int buildInfoRegion, Set<String> features,
+                          Integer imsOption, Integer smlOption, Integer dvrsOption) {
+            this.product = cleanToken(product);
+            String[] parts = this.product.isEmpty() ? new String[0] : this.product.split("\\.");
+            this.model = parts.length > 0 ? parts[0].trim().toUpperCase(Locale.US) : "";
+            this.region = parts.length > 1 ? parts[1].trim().toUpperCase(Locale.US) : "";
+            this.buildInfoRegion = buildInfoRegion;
+            Set<String> norm = new LinkedHashSet<String>();
+            if (features != null) {
+                for (String f : features) {
+                    if (f != null && !f.trim().isEmpty()) {
+                        norm.add(f.trim().toLowerCase(Locale.US));
+                    }
+                }
+            }
+            this.features = Collections.unmodifiableSet(norm);
+            this.imsOption = imsOption;
+            this.smlOption = smlOption;
+            this.dvrsOption = dvrsOption;
+        }
+
+        public boolean isKorea() {
+            if ("KOR".equals(region) || "KR".equals(region)) return true;
+            if (!region.isEmpty()) return false;
+            if (buildInfoRegion >= 0) return buildInfoRegion == 0;
+            return true; // Unknown environment: stay permissive
+        }
+
+        public boolean isBaseSeTrim() {
+            return model.length() > 2 && model.endsWith("SE");
+        }
+
+        public boolean isKnownNonSmlVehicle() {
+            if (isBaseSeTrim()) return true;
+            return model.startsWith("NEEV") || model.startsWith("CEEV") || model.startsWith("CVEV")
+                    || model.startsWith("JW") || model.startsWith("JK") || model.startsWith("GV")
+                    || model.startsWith("G80") || model.startsWith("G90");
+        }
+
+        public boolean hasFeatureContaining(String sub) {
+            String needle = sub.toLowerCase(Locale.US);
+            for (String f : features) {
+                if (f.contains(needle)) return true;
+            }
+            return false;
+        }
+
+        public boolean hasFeatureToken(String token) {
+            String t = token.toLowerCase(Locale.US);
+            for (String f : features) {
+                if (f.equals(t) || f.endsWith("." + t) || f.contains("." + t + ".")
+                        || f.endsWith("_" + t) || f.contains("_" + t + "_")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    public static Set<String> readPermissionXmlFeatures(File permDir) {
+        Set<String> out = new LinkedHashSet<String>();
+        if (permDir == null || !permDir.isDirectory()) return out;
+        File[] files = permDir.listFiles();
+        if (files == null) return out;
+        for (File f : files) {
+            if (f == null || !f.isFile() || !f.getName().endsWith(".xml") || !f.canRead()) continue;
+            try {
+                String xml = readUtf8(f);
+                int idx = 0;
+                while ((idx = xml.indexOf("<feature", idx)) >= 0) {
+                    int close = xml.indexOf('>', idx);
+                    if (close < 0) break;
+                    String tag = xml.substring(idx, close);
+                    int nPos = tag.indexOf("name=");
+                    if (nPos >= 0) {
+                        int q1 = nPos + 5;
+                        while (q1 < tag.length() && (tag.charAt(q1) == ' ' || tag.charAt(q1) == '\t')) q1++;
+                        if (q1 < tag.length() && (tag.charAt(q1) == '"' || tag.charAt(q1) == '\'')) {
+                            char quote = tag.charAt(q1);
+                            int q2 = tag.indexOf(quote, q1 + 1);
+                            if (q2 > q1 + 1) {
+                                out.add(tag.substring(q1 + 1, q2).trim().toLowerCase(Locale.US));
+                            }
+                        }
+                    }
+                    idx = close + 1;
+                }
+            } catch (Throwable ignored) {}
+        }
+        return out;
+    }
+
+    /**
+     * Checks whether a stock ("system") tile corresponds to an optional trim/regional feature that
+     * is absent on the current Gen5W vehicle, even when shared onebin firmware or unpruned factory
+     * all_menu rows still mention it. Never suppresses equipped standard stock apps.
+     */
+    public static boolean isSupportedStockFeature(String title, String pkg, String cls, Gen5wFacts facts) {
+        if (facts == null) return true;
+        String t = cleanToken(title).toLowerCase(Locale.US);
+        String p = cleanToken(pkg).toLowerCase(Locale.US);
+        String c = cleanToken(cls).toLowerCase(Locale.US);
+        String probe = p + "/" + c;
+
+        // 1. Naver VIBE (South Korea domestic streaming music service)
+        if ("vibe".equals(t) || p.contains("naver.vibe") || p.endsWith(".vibe") || c.contains(".vibe")) {
+            return facts.hasFeatureContaining("vibe") || facts.isKorea();
+        }
+
+        // 2. Built-in Cam / DVRS (dashcam hardware option; KOR-only on Gen5W unless DVRS feature present)
+        if ("built-in cam".equals(t) || "built in cam".equals(t)
+                || probe.contains("dvrs") || probe.contains("builtincam") || probe.contains("builtin_cam")) {
+            if (facts.dvrsOption != null) return facts.dvrsOption.intValue() > 0;
+            if (facts.hasFeatureContaining("dvrs") || facts.hasFeatureContaining("builtincam")) return true;
+            return facts.isKorea();
+        }
+
+        // 3. Sound Mood Lamp (music-reactive door/speaker mood lamp on select Kia models; absent on E-GMP / SE)
+        if ("sound mood lamp".equals(t) || probe.contains("soundmood") || probe.contains("sound_mood")
+                || probe.contains("moodlamp") || probe.contains("mood_lamp")) {
+            if (facts.smlOption != null) return facts.smlOption.intValue() > 0;
+            if (facts.hasFeatureContaining("soundmood") || facts.hasFeatureContaining("moodlamp")
+                    || facts.hasFeatureToken("sml")) {
+                return true;
+            }
+            if (facts.isKnownNonSmlVehicle()) return false;
+            return true;
+        }
+
+        // 4. Memory Seat Configuration / IMS (Integrated Memory System seat screen; absent on SE / non-IMS trims)
+        if ("memory seat configuration".equals(t) || t.contains("memory seat")
+                || probe.contains("memoryseat") || probe.contains("seatmemory")
+                || probe.contains("imsseat") || probe.contains(".ims.")
+                || c.endsWith("imsactivity") || c.endsWith("imsmainactivity") || c.contains("seatposition")) {
+            if (facts.imsOption != null) return facts.imsOption.intValue() > 0;
+            if (facts.hasFeatureContaining("memoryseat") || facts.hasFeatureContaining("seatmemory")
+                    || facts.hasFeatureToken("ims")) {
+                return true;
+            }
+            if (facts.isBaseSeTrim()) return false;
+            return true;
+        }
+
+        return true;
+    }
+
+    /**
      * Filters unequipped trim/region ghost stock entries (e.g. Built-in Cam, Memory Seat
-     * Configuration, Sound Mood Lamp, VIBE on cars that do not have them in all_menu) while
-     * preserving all equipped stock entries, all backed-up entries, and any hidden keys.
+     * Configuration, Sound Mood Lamp, VIBE) against the vehicle's active all_menu + Tile Manager
+     * slot backups. Note: cfg.hidden is intentionally NOT exempted here so stale ghost keys from
+     * older versions cannot keep unequipped entries alive; real hidden tiles are preserved via
+     * hmgapi-tile-manager-backup.json inside MenuInventory.equippedKeys.
      */
     public static boolean isEquippedSystemTile(String key, String pkg, String cls,
-                                               MenuInventory inv, Set<String> hiddenKeys) {
+                                               MenuInventory inv, Set<String> multiEntryPackages) {
         if (inv == null || !inv.hasAnyData()) return true;
-        if (matchingHiddenKey(hiddenKeys, pkg, cls, -1) != null) return true;
         if (inv.equippedKeys.contains(key)) return true;
         String p = cleanToken(pkg);
         String c = cleanToken(cls);
         if (!p.isEmpty()) {
-            if (inv.equippedKeys.contains(p + "/*")) return true;
-            if ((c.isEmpty() || "*".equals(c)) && inv.equippedPackages.contains(p)) return true;
+            boolean isMulti = "com.android.settings".equals(p)
+                    || (multiEntryPackages != null && multiEntryPackages.contains(p));
+            if (!isMulti) {
+                if (inv.equippedKeys.contains(p + "/*")) return true;
+                if ((c.isEmpty() || "*".equals(c)) && inv.equippedPackages.contains(p)) return true;
+            } else if ("com.android.settings/com.android.settings.Settings".equals(key)
+                    && inv.equippedKeys.contains("com.android.settings/*")) {
+                return true;
+            }
         }
         return false;
     }

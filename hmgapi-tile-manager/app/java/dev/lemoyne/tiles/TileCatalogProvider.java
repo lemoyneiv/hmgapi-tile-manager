@@ -6,6 +6,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.FeatureInfo;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
@@ -20,8 +21,13 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -29,11 +35,11 @@ import java.util.Set;
 /**
  * Lightweight IPC ContentProvider bridging com.android.launcher3, com.hkmc.system.app.homesetting,
  * and the Tile Manager UI on stock Open-HMG/HMG-API without requiring any core daemon changes:
- *  - putCatalog / getCatalog: live schema-2 catalog of equipped stock + custom/mod launcher tiles
+ *  - putCatalog / getCatalog: live schema-3 catalog of equipped stock + custom/mod launcher tiles
  *  - getConfig / putConfig: instant cross-process tile visibility & gap-compaction settings
  */
 public final class TileCatalogProvider extends ContentProvider {
-    static final int CATALOG_SCHEMA = 2;
+    static final int CATALOG_SCHEMA = 3;
     static final String AUTHORITY = "dev.lemoyne.tiles.provider";
     static final Uri URI = Uri.parse("content://" + AUTHORITY);
     static final Uri ALL_MENU = Uri.parse("content://com.hkmc.system.app.homesetting.provider/all_menu");
@@ -45,6 +51,7 @@ public final class TileCatalogProvider extends ContentProvider {
     private static final String LEGACY_PUBLIC_CONFIG = "/data/hmgapi/public/launcher-tiles.json";
     private static final File PUBLIC_STATE = new File("/data/hmgapi/public/state.json");
     private static final File MODS_ROOT = new File("/data/hmgapi/mods");
+    private static final File PERMISSIONS_DIR = new File("/system/etc/permissions");
 
     private static final Object LOCK = new Object();
     private static volatile Runnable catalogListener;
@@ -73,8 +80,8 @@ public final class TileCatalogProvider extends ContentProvider {
                 int schema = doc.optInt("schema", 1);
                 String toWrite;
                 if (schema < CATALOG_SCHEMA) {
-                    // Pre-reboot v1.0.0 hook in launcher3: enrich with live HMG-API mods + all_menu
-                    // and mark hook_outdated=true so UI prompts for a reboot.
+                    // Pre-reboot older hook in launcher3: heal classifications & ghost entries
+                    // immediately and mark hook_outdated=true so UI prompts for a reboot.
                     JSONObject upgraded = enrichBootstrapCatalog(ctx, doc, true);
                     toWrite = upgraded != null ? upgraded.toString() : doc.toString();
                 } else {
@@ -136,7 +143,7 @@ public final class TileCatalogProvider extends ContentProvider {
                     if (doc.optInt("schema", 1) >= CATALOG_SCHEMA) {
                         return raw;
                     }
-                    // Stale v1.0.0 catalog on disk: upgrade/clean immediately
+                    // Stale schema < 3 catalog on disk: heal classifications & ghost entries immediately
                     JSONObject upgraded = enrichBootstrapCatalog(ctx, doc, true);
                     if (upgraded != null) {
                         writeAtomic(f, upgraded.toString());
@@ -156,32 +163,29 @@ public final class TileCatalogProvider extends ContentProvider {
             Set<String> activeMenuKeys = new LinkedHashSet<String>();
             Set<String> activeMenuPackages = new LinkedHashSet<String>();
             Map<String, JSONObject> menuRecords = new LinkedHashMap<String, JSONObject>();
+            Map<String, String> modByPkg = readModPackagesMap();
 
-            // 1. Try reading all_menu if accessible from this process
+            // 1. Read ALL_MENU preferring Driver 1 (or non-Guest profiles) so unpruned factory
+            //    Guest/Driver 2 rows do not inject ghost tiles.
+            List<String> driver1Jsons = new ArrayList<String>();
+            List<String> nonGuestJsons = new ArrayList<String>();
+            List<String> allJsons = new ArrayList<String>();
             Cursor cur = null;
             try {
                 cur = ctx.getContentResolver().query(ALL_MENU, null, null, null, null);
                 if (cur != null) {
+                    int userCol = cur.getColumnIndex("userName");
                     int itemsCol = cur.getColumnIndex("menu_items");
                     while (cur.moveToNext()) {
+                        String user = userCol >= 0 ? clean(cur.getString(userCol)) : "";
                         String json = itemsCol >= 0 ? cur.getString(itemsCol) : null;
                         if (json == null || json.isEmpty()) continue;
-                        JSONObject root = new JSONObject(json);
-                        JSONArray items = root.optJSONArray("menuItems");
-                        if (items == null) continue;
-                        for (int i = 0; i < items.length(); i++) {
-                            JSONObject it = items.optJSONObject(i);
-                            if (it == null) continue;
-                            String pkg = clean(it.optString("packageName", ""));
-                            String cls = clean(it.optString("className", ""));
-                            int id = it.optInt("itemId", -1);
-                            if ("Empty view".equals(pkg) || "Empty view".equals(cls)) continue;
-                            if (pkg.isEmpty() && cls.isEmpty() && (id <= 0 || id == 39)) continue;
-                            String key = normKey(pkg, cls, id);
-                            if (key.isEmpty()) continue;
-                            activeMenuKeys.add(key);
-                            if (!pkg.isEmpty()) activeMenuPackages.add(pkg);
-                            if (!menuRecords.containsKey(key)) menuRecords.put(key, it);
+                        allJsons.add(json);
+                        if ("Driver 1".equalsIgnoreCase(user)) {
+                            driver1Jsons.add(json);
+                        }
+                        if (!"Guest".equalsIgnoreCase(user)) {
+                            nonGuestJsons.add(json);
                         }
                     }
                 }
@@ -190,7 +194,32 @@ public final class TileCatalogProvider extends ContentProvider {
                 if (cur != null) cur.close();
             }
 
-            // Also preserve any currently hidden keys
+            List<String> chosenJsons = !driver1Jsons.isEmpty() ? driver1Jsons
+                    : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons);
+            for (String json : chosenJsons) {
+                try {
+                    JSONObject root = new JSONObject(json);
+                    JSONArray items = root.optJSONArray("menuItems");
+                    if (items == null) continue;
+                    for (int i = 0; i < items.length(); i++) {
+                        JSONObject it = items.optJSONObject(i);
+                        if (it == null) continue;
+                        String pkg = clean(it.optString("packageName", ""));
+                        String cls = clean(it.optString("className", ""));
+                        int id = it.optInt("itemId", -1);
+                        if ("Empty view".equals(pkg) || "Empty view".equals(cls)) continue;
+                        if (pkg.isEmpty() && cls.isEmpty() && (id <= 0 || id == 39)) continue;
+                        String key = normKey(pkg, cls, id);
+                        if (key.isEmpty()) continue;
+                        activeMenuKeys.add(key);
+                        if (!pkg.isEmpty()) activeMenuPackages.add(pkg);
+                        if (!menuRecords.containsKey(key)) menuRecords.put(key, it);
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            // Read currently hidden keys so real hidden tiles backed up in launcher3's private
+            // filesDir stay visible during a pre-reboot legacy catalog upgrade
             Set<String> hidden = new LinkedHashSet<String>();
             String cfgRaw = readEffectiveConfigJsonLocked(ctx);
             if (cfgRaw != null) {
@@ -206,11 +235,27 @@ public final class TileCatalogProvider extends ContentProvider {
             }
 
             boolean hasMenuFilter = !activeMenuKeys.isEmpty();
+            Set<String> multiEntryPackages = new LinkedHashSet<String>();
+            multiEntryPackages.add("com.android.settings");
 
-            // 2. Filter legacy tiles (if any) against equipped all_menu
+            // 2. Reclassify & filter legacy tiles (healing v1.0.1's nonStockPkg & ghost entries immediately)
             if (legacyDoc != null) {
                 JSONArray oldArr = legacyDoc.optJSONArray("tiles");
                 if (oldArr != null) {
+                    Map<String, Integer> pkgKeyCounts = new LinkedHashMap<String, Integer>();
+                    for (int i = 0; i < oldArr.length(); i++) {
+                        JSONObject row = oldArr.optJSONObject(i);
+                        if (row == null) continue;
+                        String pkg = clean(row.optString("packageName", ""));
+                        if (!pkg.isEmpty()) {
+                            Integer prev = pkgKeyCounts.get(pkg);
+                            pkgKeyCounts.put(pkg, Integer.valueOf(prev == null ? 1 : prev.intValue() + 1));
+                        }
+                    }
+                    for (Map.Entry<String, Integer> pe : pkgKeyCounts.entrySet()) {
+                        if (pe.getValue().intValue() > 1) multiEntryPackages.add(pe.getKey());
+                    }
+
                     for (int i = 0; i < oldArr.length(); i++) {
                         JSONObject row = oldArr.optJSONObject(i);
                         if (row == null) continue;
@@ -219,15 +264,28 @@ public final class TileCatalogProvider extends ContentProvider {
                         String key = normKeyString(row.optString("key", ""));
                         if (key.isEmpty()) key = normKey(pkg, cls, -1);
                         if (key.isEmpty()) continue;
-                        String kind = "package".equals(row.optString("kind", "")) ? "package" : "system";
-                        if ("system".equals(kind) && hasMenuFilter
-                                && !activeMenuKeys.contains(key)
-                                && !hidden.contains(key)
-                                && !((cls.isEmpty() || "*".equals(cls)) && activeMenuPackages.contains(pkg))) {
-                            continue;
+                        String title = clean(row.optString("title", ""));
+                        String modId = modByPkg.get(pkg);
+                        if (modId == null) {
+                            if ("hmgapi.app".equals(pkg) || pkg.startsWith("hmgapi.")) modId = "hmgapi";
+                            else if (isNemesisTile(pkg, title, -1)) modId = "nemesis";
                         }
-                        JSONObject copy = new JSONObject(row.toString());
+                        String kind = classifyKind(ctx, pkg, title, -1, modId);
+                        if ("system".equals(kind)) {
+                            if (!isTargetComponentInstalled(ctx, pkg, cls)) continue;
+                            if (!isSupportedStockFeature(ctx, title, pkg, cls)) continue;
+                            if (hasMenuFilter && !isEquippedInMenu(key, pkg, cls, activeMenuKeys,
+                                    activeMenuPackages, multiEntryPackages) && !hidden.contains(key)) {
+                                continue;
+                            }
+                        }
+                        JSONObject copy = new JSONObject();
                         copy.put("key", key);
+                        copy.put("packageName", pkg);
+                        copy.put("className", cls);
+                        copy.put("title", "system".equals(kind) ? friendlyTitle(title, pkg, cls) : title);
+                        copy.put("kind", kind);
+                        if (modId != null) copy.put("mod", modId);
                         byKey.put(key, copy);
                     }
                 }
@@ -289,7 +347,8 @@ public final class TileCatalogProvider extends ContentProvider {
                 } catch (Throwable ignored) {}
             }
 
-            // 4. Add any remaining equipped tiles from all_menu
+            // 4. Add remaining tiles from ALL_MENU (only custom packages if legacyDoc already supplied
+            //    Launcher_WP3's stock catalog; otherwise filter stock tiles strictly)
             for (Map.Entry<String, JSONObject> e : menuRecords.entrySet()) {
                 String key = e.getKey();
                 if (byKey.containsKey(key)) continue;
@@ -298,16 +357,25 @@ public final class TileCatalogProvider extends ContentProvider {
                 String cls = clean(it.optString("className", ""));
                 int id = it.optInt("itemId", -1);
                 String label = resolveAppLabel(ctx, pkg, cls);
-                boolean isPkg = !isStockPackage(pkg) || isUserInstalledPkg(ctx, pkg) || id >= 9000 || id == 90;
+                String modId = modByPkg.get(pkg);
+                if (modId == null) {
+                    if ("hmgapi.app".equals(pkg) || pkg.startsWith("hmgapi.")) modId = "hmgapi";
+                    else if (isNemesisTile(pkg, label, id)) modId = "nemesis";
+                }
+                String kind = classifyKind(ctx, pkg, label, id, modId);
+                if ("system".equals(kind)) {
+                    if (legacyDoc != null) continue;
+                    if (!isTargetComponentInstalled(ctx, pkg, cls)) continue;
+                    String titleCandidate = friendlyTitle(label, pkg, cls);
+                    if (!isSupportedStockFeature(ctx, titleCandidate, pkg, cls)) continue;
+                }
                 JSONObject r = new JSONObject();
                 r.put("key", key);
                 r.put("packageName", pkg);
                 r.put("className", cls);
-                r.put("title", isPkg ? label : friendlyTitle(label, pkg, cls));
-                r.put("kind", isPkg ? "package" : "system");
-                if (pkg.toLowerCase(Locale.US).contains("nemesis") || pkg.toLowerCase(Locale.US).contains("xwtk") || id == 90) {
-                    r.put("mod", "nemesis");
-                }
+                r.put("title", "package".equals(kind) ? label : friendlyTitle(label, pkg, cls));
+                r.put("kind", kind);
+                if (modId != null) r.put("mod", modId);
                 byKey.put(key, r);
             }
 
@@ -324,6 +392,95 @@ public final class TileCatalogProvider extends ContentProvider {
         }
     }
 
+    private static boolean isEquippedInMenu(String key, String pkg, String cls,
+                                            Set<String> activeMenuKeys, Set<String> activeMenuPackages,
+                                            Set<String> multiEntryPackages) {
+        if (activeMenuKeys.contains(key)) return true;
+        if (!pkg.isEmpty()) {
+            boolean isMulti = "com.android.settings".equals(pkg)
+                    || (multiEntryPackages != null && multiEntryPackages.contains(pkg));
+            if (!isMulti) {
+                if (activeMenuKeys.contains(pkg + "/*")) return true;
+                if ((cls.isEmpty() || "*".equals(cls)) && activeMenuPackages.contains(pkg)) return true;
+            } else if ("com.android.settings/com.android.settings.Settings".equals(key)
+                    && activeMenuKeys.contains("com.android.settings/*")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Map<String, String> readModPackagesMap() {
+        Map<String, String> out = new LinkedHashMap<String, String>();
+        if (!PUBLIC_STATE.isFile() || !PUBLIC_STATE.canRead()) return out;
+        try {
+            JSONObject st = new JSONObject(readUtf8(PUBLIC_STATE));
+            JSONObject mods = st.optJSONObject("mods");
+            if (mods == null) return out;
+            java.util.Iterator<?> names = mods.keys();
+            while (names.hasNext()) {
+                String modId = String.valueOf(names.next());
+                JSONObject ms = mods.optJSONObject(modId);
+                if (ms == null) continue;
+                JSONArray apps = ms.optJSONArray("apps");
+                if (apps != null) {
+                    for (int i = 0; i < apps.length(); i++) {
+                        String p = clean(apps.optString(i, ""));
+                        if (!p.isEmpty()) out.put(p, modId);
+                    }
+                }
+                File mjFile = new File(new File(MODS_ROOT, modId), "mod.json");
+                if (mjFile.isFile() && mjFile.canRead()) {
+                    try {
+                        JSONObject mj = new JSONObject(readUtf8(mjFile));
+                        JSONObject prov = mj.optJSONObject("provides");
+                        JSONArray launcher = prov != null ? prov.optJSONArray("launcher") : null;
+                        if (launcher != null) {
+                            for (int i = 0; i < launcher.length(); i++) {
+                                JSONObject lm = launcher.optJSONObject(i);
+                                String p = lm != null ? clean(lm.optString("package", "")) : "";
+                                if (!p.isEmpty()) out.put(p, modId);
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable ignored) {}
+        return out;
+    }
+
+    private static boolean isNemesisTile(String pkg, String title, int itemId) {
+        String lowPkg = clean(pkg).toLowerCase(Locale.US);
+        String upTitle = title == null ? "" : title.toUpperCase(Locale.US);
+        return lowPkg.contains("nemesis") || lowPkg.contains("xwtk")
+                || upTitle.contains("NEMESIS") || itemId == 90;
+    }
+
+    static String classifyKind(Context ctx, String pkg, String title, int itemId, String modId) {
+        String p = clean(pkg);
+        boolean isHmgApp = "hmgapi.app".equals(p) || p.startsWith("hmgapi.");
+        boolean isNemesis = isNemesisTile(p, title, itemId);
+        boolean isUserPkg = isUserInstalledPkg(ctx, p);
+        boolean hasMod = modId != null && !modId.trim().isEmpty();
+        return (isHmgApp || isNemesis || isUserPkg || hasMod || itemId >= 9000) ? "package" : "system";
+    }
+
+    static boolean isGhostSystemKey(Context ctx, String hiddenKey) {
+        if (hiddenKey == null || hiddenKey.startsWith("@")) return false;
+        int slash = hiddenKey.indexOf('/');
+        if (slash <= 0) return false;
+        String pkg = hiddenKey.substring(0, slash).trim();
+        String cls = hiddenKey.substring(slash + 1).trim();
+        if (pkg.isEmpty()) return false;
+        Map<String, String> mods = readModPackagesMap();
+        if ("package".equals(classifyKind(ctx, pkg, "", -1, mods.get(pkg)))) {
+            return false;
+        }
+        if (!isTargetComponentInstalled(ctx, pkg, cls)) return true;
+        String label = resolveAppLabel(ctx, pkg, cls);
+        return !isSupportedStockFeature(ctx, label, pkg, cls);
+    }
+
     private static boolean isPackageInstalled(Context ctx, String pkg) {
         try {
             ctx.getPackageManager().getApplicationInfo(pkg, 0);
@@ -334,32 +491,239 @@ public final class TileCatalogProvider extends ContentProvider {
     }
 
     private static boolean isUserInstalledPkg(Context ctx, String pkg) {
-        if (pkg == null || pkg.isEmpty()) return false;
+        if (ctx == null || pkg == null || pkg.isEmpty()) return false;
         try {
             ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(pkg, 0);
-            return (ai.flags & ApplicationInfo.FLAG_SYSTEM) == 0;
+            return (ai.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) == 0;
         } catch (Throwable ignored) {
             return false;
         }
     }
 
-    static boolean isStockPackage(String pkg) {
-        String p = clean(pkg).toLowerCase(Locale.US);
-        if (p.isEmpty()) return true;
-        if (p.contains("nemesis") || p.contains("xwtk") || p.contains("hmgapi")
-                || p.contains("leafia") || p.contains("evergreen") || p.startsWith("dev.lemoyne.")) {
+    private static boolean isTargetComponentInstalled(Context ctx, String pkg, String cls) {
+        String p = clean(pkg);
+        if (ctx == null || p.isEmpty()) return true;
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            ApplicationInfo ai = pm.getApplicationInfo(p, 0);
+            if (!ai.enabled) return false;
+            try {
+                int appState = pm.getApplicationEnabledSetting(p);
+                if (appState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED || appState == 3) {
+                    return false;
+                }
+            } catch (Throwable ignored) {}
+
+            String c = clean(cls);
+            String fullCls = c.startsWith(".") ? p + c : c;
+            if (!fullCls.isEmpty() && !"*".equals(fullCls) && fullCls.indexOf('.') > 0) {
+                ComponentName cn = new ComponentName(p, fullCls);
+                try {
+                    int compState = pm.getComponentEnabledSetting(cn);
+                    if (compState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED || compState == 3) {
+                        return false;
+                    }
+                } catch (Throwable ignored) {}
+                try {
+                    ActivityInfo act = pm.getActivityInfo(cn, 0);
+                    if (!act.enabled) return false;
+                } catch (PackageManager.NameNotFoundException nf) {
+                    if ("com.android.settings".equals(p)) return false;
+                }
+            }
+            return true;
+        } catch (PackageManager.NameNotFoundException nf) {
             return false;
+        } catch (Throwable ignored) {
+            return true;
         }
-        return p.startsWith("com.hkmc.") || p.startsWith("com.hyundai.") || p.startsWith("com.kia.")
-                || p.startsWith("com.genesis.") || p.startsWith("com.mnsoft.") || p.startsWith("com.daudio.")
-                || p.startsWith("com.mobis.") || p.startsWith("com.bul.") || p.startsWith("com.lge.")
-                || p.startsWith("com.obigo.") || p.startsWith("com.telechips.") || p.startsWith("com.sdcard.")
-                || p.startsWith("com.android.") || p.startsWith("com.google.android.projection.")
-                || p.startsWith("com.siriusxm.") || p.startsWith("com.aharadio.")
-                || p.startsWith("com.soundhound.") || p.startsWith("com.melodis.")
-                || p.startsWith("com.harman.") || p.startsWith("com.qnx.") || p.startsWith("com.nuance.")
-                || p.startsWith("com.naver.") || p.startsWith("com.melon.") || p.startsWith("com.genie.")
-                || p.startsWith("com.kakao.") || "android".equals(p);
+    }
+
+    private static boolean isSupportedStockFeature(Context ctx, String title, String pkg, String cls) {
+        String t = clean(title).toLowerCase(Locale.US);
+        String p = clean(pkg).toLowerCase(Locale.US);
+        String c = clean(cls).toLowerCase(Locale.US);
+        String probe = p + "/" + c;
+
+        String product = readSysProp("ro.build.product");
+        if (product.isEmpty()) product = readSysProp("ro.product.name");
+        String[] parts = product.isEmpty() ? new String[0] : product.split("\\.");
+        String model = parts.length > 0 ? parts[0].trim().toUpperCase(Locale.US) : "";
+        String region = parts.length > 1 ? parts[1].trim().toUpperCase(Locale.US) : "";
+        int buildInfoRegion = readBuildInfoRegion();
+        boolean isKorea = "KOR".equals(region) || "KR".equals(region)
+                || (region.isEmpty() && (buildInfoRegion < 0 || buildInfoRegion == 0));
+        boolean isBaseSe = model.length() > 2 && model.endsWith("SE");
+
+        if ("vibe".equals(t) || p.contains("naver.vibe") || p.endsWith(".vibe") || c.contains(".vibe")) {
+            Set<String> feats = readDeviceFeatures(ctx);
+            return hasFeatureSub(feats, "vibe") || isKorea;
+        }
+        if ("built-in cam".equals(t) || "built in cam".equals(t)
+                || probe.contains("dvrs") || probe.contains("builtincam") || probe.contains("builtin_cam")) {
+            Integer opt = probeServiceOption("dvrs", "builtincam");
+            if (opt != null) return opt.intValue() > 0;
+            Set<String> feats = readDeviceFeatures(ctx);
+            if (hasFeatureSub(feats, "dvrs") || hasFeatureSub(feats, "builtincam")) return true;
+            return isKorea;
+        }
+        if ("sound mood lamp".equals(t) || probe.contains("soundmood") || probe.contains("sound_mood")
+                || probe.contains("moodlamp") || probe.contains("mood_lamp")) {
+            Integer opt = probeServiceOption("soundmood", "moodlamp", "sml");
+            if (opt != null) return opt.intValue() > 0;
+            Set<String> feats = readDeviceFeatures(ctx);
+            if (hasFeatureSub(feats, "soundmood") || hasFeatureSub(feats, "moodlamp")
+                    || hasFeatureToken(feats, "sml")) {
+                return true;
+            }
+            if (isBaseSe || model.startsWith("NEEV") || model.startsWith("CEEV") || model.startsWith("CVEV")
+                    || model.startsWith("JW") || model.startsWith("JK") || model.startsWith("GV")
+                    || model.startsWith("G80") || model.startsWith("G90")) {
+                return false;
+            }
+            return true;
+        }
+        if ("memory seat configuration".equals(t) || t.contains("memory seat")
+                || probe.contains("memoryseat") || probe.contains("seatmemory")
+                || probe.contains("imsseat") || probe.contains(".ims.")
+                || c.endsWith("imsactivity") || c.endsWith("imsmainactivity") || c.contains("seatposition")) {
+            Integer opt = probeServiceOption("memoryseat", "seatmemory", "ims");
+            if (opt != null) return opt.intValue() > 0;
+            Set<String> feats = readDeviceFeatures(ctx);
+            if (hasFeatureSub(feats, "memoryseat") || hasFeatureSub(feats, "seatmemory")
+                    || hasFeatureToken(feats, "ims")) {
+                return true;
+            }
+            if (isBaseSe) return false;
+            return true;
+        }
+        return true;
+    }
+
+    private static String readSysProp(String key) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Method m = sp.getMethod("get", String.class, String.class);
+            Object v = m.invoke(null, key, "");
+            return v != null ? clean(String.valueOf(v)) : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static int readBuildInfoRegion() {
+        try {
+            Class<?> bi = Class.forName("com.hkmc.BuildInfo");
+            Field f = bi.getField("REGION");
+            Object v = f.get(null);
+            if (v instanceof Number) return ((Number) v).intValue();
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private static Set<String> readDeviceFeatures(Context ctx) {
+        Set<String> out = new LinkedHashSet<String>();
+        if (PERMISSIONS_DIR.isDirectory()) {
+            File[] files = PERMISSIONS_DIR.listFiles();
+            if (files != null) {
+                for (File f : files) {
+                    if (f == null || !f.isFile() || !f.getName().endsWith(".xml") || !f.canRead()) continue;
+                    try {
+                        String xml = readUtf8(f);
+                        int idx = 0;
+                        while ((idx = xml.indexOf("<feature", idx)) >= 0) {
+                            int close = xml.indexOf('>', idx);
+                            if (close < 0) break;
+                            String tag = xml.substring(idx, close);
+                            int nPos = tag.indexOf("name=");
+                            if (nPos >= 0) {
+                                int q1 = nPos + 5;
+                                while (q1 < tag.length() && (tag.charAt(q1) == ' ' || tag.charAt(q1) == '\t')) q1++;
+                                if (q1 < tag.length() && (tag.charAt(q1) == '"' || tag.charAt(q1) == '\'')) {
+                                    char quote = tag.charAt(q1);
+                                    int q2 = tag.indexOf(quote, q1 + 1);
+                                    if (q2 > q1 + 1) {
+                                        out.add(tag.substring(q1 + 1, q2).trim().toLowerCase(Locale.US));
+                                    }
+                                }
+                            }
+                            idx = close + 1;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+        }
+        if (ctx != null) {
+            try {
+                FeatureInfo[] avail = ctx.getPackageManager().getSystemAvailableFeatures();
+                if (avail != null) {
+                    for (FeatureInfo fi : avail) {
+                        if (fi != null && fi.name != null && !fi.name.trim().isEmpty()) {
+                            out.add(fi.name.trim().toLowerCase(Locale.US));
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        return out;
+    }
+
+    private static boolean hasFeatureSub(Set<String> feats, String sub) {
+        for (String f : feats) {
+            if (f.contains(sub)) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasFeatureToken(Set<String> feats, String tok) {
+        for (String f : feats) {
+            if (f.equals(tok) || f.endsWith("." + tok) || f.contains("." + tok + ".")
+                    || f.endsWith("_" + tok) || f.contains("_" + tok + "_")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Integer probeServiceOption(String... tokens) {
+        String[][] services = new String[][] {
+            { "usm", "com.hkmc.usm.IUSMService$Stub" },
+            { "system_service", "com.hkmc.system.ISystemService$Stub" },
+            { "bcm", "com.hkmc.bcm.IBCMService$Stub" }
+        };
+        try {
+            Class<?> sm = Class.forName("android.os.ServiceManager");
+            Method getSvc = sm.getMethod("getService", String.class);
+            Class<?> ibinder = Class.forName("android.os.IBinder");
+            for (String[] pair : services) {
+                try {
+                    Object binder = getSvc.invoke(null, pair[0]);
+                    if (binder == null) continue;
+                    Class<?> stub = Class.forName(pair[1]);
+                    Object iface = stub.getMethod("asInterface", ibinder).invoke(null, binder);
+                    if (iface == null) continue;
+                    for (Method m : iface.getClass().getMethods()) {
+                        if (m.getParameterTypes().length != 0 || Modifier.isStatic(m.getModifiers())) continue;
+                        Class<?> rt = m.getReturnType();
+                        if (rt != boolean.class && rt != Boolean.class && rt != int.class && rt != Integer.class) {
+                            continue;
+                        }
+                        String low = m.getName().toLowerCase(Locale.US);
+                        if (!(low.startsWith("issupport") || (low.startsWith("get") && low.endsWith("option")))) {
+                            continue;
+                        }
+                        for (String tok : tokens) {
+                            if (low.contains(tok)) {
+                                Object res = m.invoke(iface);
+                                if (res instanceof Boolean) return Integer.valueOf(((Boolean) res).booleanValue() ? 1 : 0);
+                                if (res instanceof Number) return Integer.valueOf(((Number) res).intValue());
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private static String resolveAppLabel(Context ctx, String pkg, String cls) {
