@@ -1,11 +1,14 @@
 package dev.lemoyne.tiles.hook;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
 
@@ -399,9 +402,9 @@ public final class TileStoreTest {
                 TileStore.isEquippedSystemTile("com.hkmc.radio/com.hkmc.radio.RadioActivity",
                         "com.hkmc.radio", "com.hkmc.radio.RadioActivity", pkgOnlySettingsInv, multiPkgs));
 
-        // 16. v1.0.3 regressions: schema-4 parity, wildcard backup/equip/restore, EntryInspector
+        // 16. v1.0.3 regressions: schema-5 parity, wildcard backup/equip/restore, EntryInspector
         //     wildcard-matched itemId disambiguation, and renamed owner profile selection
-        check("TileStore.CATALOG_SCHEMA is 4", Integer.valueOf(4), Integer.valueOf(TileStore.CATALOG_SCHEMA));
+        check("TileStore.CATALOG_SCHEMA is 5", Integer.valueOf(5), Integer.valueOf(TileStore.CATALOG_SCHEMA));
 
         Map<String, Object> qrBackups = new LinkedHashMap<String, Object>();
         TileStore.Config hideQrManual = new TileStore.Config(true, true, setOf("com.hkmc.qrmanual/*"));
@@ -486,6 +489,344 @@ public final class TileStoreTest {
                 radioWithIcons, i5Inv, Collections.<String>emptySet(), radioProbe, drawProbe);
         check("IntDrawableProbe skips _dis icon and picks enabled hom_radio_66",
                 Integer.valueOf(0x7f020042), Integer.valueOf(exProbe.iconId));
+
+        // 18. v1.0.5 regressions: core stock self-healing, cross-representation backup & equip
+        //     matching, multi-profile owner union, and Show All / unhide orphan re-seating
+        for (String[] core : new String[][] {
+                { "Setup", "com.android.settings", "com.android.settings.Settings" },
+                { "Radio", "", "Radio" },
+                { "Radio", "com.hkmc.radio", "com.hkmc.radio.RadioActivity" },
+                { "Media", "com.hkmc.media", "com.hkmc.media.MediaActivity" },
+                { "Phone", "com.hkmc.phone", "com.hkmc.phone.PhoneActivity" },
+                { "Phone Projection", "com.connectivity.projection", "com.connectivity.projection.MainActivity" },
+                { "Voice Memo", "com.hkmc.voicememo", "com.hkmc.voicememo.MainActivity" },
+                { "User's Manual", "com.hkmc.qrmanual", "com.hkmc.qrmanual.QRManualActivity" },
+                { "Notifications", "com.ivi.notification", "com.ivi.notification.NoticeActivity" },
+                { "Navigation Menu", "com.mnsoft.navi", "com.mnsoft.navi.NaviMenuActivity" }
+        }) {
+            checkTrue("isUnconditionalCoreStockTile accepts universal " + core[0],
+                    TileStore.isUnconditionalCoreStockTile(core[0], core[1], core[2]));
+        }
+        for (String[] nonCore : new String[][] {
+                { "VIBE", "com.naver.vibe", "com.naver.vibe.MainActivity" },
+                { "Built-in Cam", "com.hkmc.dvrs", "com.hkmc.dvrs.DvrsActivity" },
+                { "Sound Mood Lamp", "com.hkmc.soundmood", "com.hkmc.soundmood.MainActivity" },
+                { "Memory Seat Configuration", "com.android.settings", "com.android.settings.ImsSeatActivity" },
+                { "EV", "com.hkmc.ev", "com.hkmc.ev.EvActivity" },
+                { "Hyundai Pay", "com.hmc.carpay", "com.hmc.carpay.CarPayActivity" },
+                { "Bluelink", "com.hkmc.telematics.bluelink", "com.hkmc.telematics.bluelink.Main" },
+                { "Valet Mode", "com.hmc.valetmode", "com.hmc.valetmode.ValetActivity" },
+                { "HD Radio Data", "com.hkmc.hdradio", "com.hkmc.hdradio.MainActivity" },
+                { "SiriusXM", "com.siriusxm.app", "com.siriusxm.app.MainActivity" }
+        }) {
+            check("isUnconditionalCoreStockTile rejects optional/trim " + nonCore[0], Boolean.FALSE,
+                    Boolean.valueOf(TileStore.isUnconditionalCoreStockTile(nonCore[0], nonCore[1], nonCore[2])));
+        }
+
+        // Cross-representation isEquippedSystemTile matching (single-package class difference, @class/Radio, itemId)
+        checkTrue("com.hkmc.radio/.RadioActivity matches @class/Radio in all_menu",
+                TileStore.isEquippedSystemTile("com.hkmc.radio/com.hkmc.radio.RadioActivity",
+                        "com.hkmc.radio", "com.hkmc.radio.RadioActivity", -1, i5Inv, multiPkgs));
+        checkTrue("single-tile package matches alternate activity class in all_menu",
+                TileStore.isEquippedSystemTile("com.hkmc.qrmanual/com.hkmc.qrmanual.WebManualActivity",
+                        "com.hkmc.qrmanual", "com.hkmc.qrmanual.WebManualActivity", -1, i5Inv, multiPkgs));
+        checkTrue("itemId correlation marks system tile equipped",
+                TileStore.isEquippedSystemTile("com.unknown.oem/com.unknown.oem.MainActivity",
+                        "com.unknown.oem", "com.unknown.oem.MainActivity", 8, i5Inv, multiPkgs));
+        check("Memory Seat sub-activity stays rejected under cross-representation check", Boolean.FALSE,
+                Boolean.valueOf(TileStore.isEquippedSystemTile(
+                        "com.android.settings/com.android.settings.ImsSeatActivity",
+                        "com.android.settings", "com.android.settings.ImsSeatActivity", -1, i5Inv, multiPkgs)));
+
+        // @class/Radio backup MUST NOT be dropped when installedKeys contains com.hkmc.radio/.RadioActivity
+        Map<String, Object> radioBak = new LinkedHashMap<String, Object>();
+        TileStore.Config hideVirtualRadio = new TileStore.Config(true, false, setOf("@class/Radio"));
+        TileStore.SyncResult rHideVirtualRadio = TileStore.syncProfileMenu("Driver 1", i5Menu, hideVirtualRadio, null, radioBak);
+        checkTrue("hiding @class/Radio updates menu", rHideVirtualRadio.updatedMenuJson != null);
+        Set<String> installedPkgRadioOnly = setOf("com.hkmc.radio/com.hkmc.radio.RadioActivity");
+        TileStore.SyncResult rRestoreVirtualRadio = TileStore.syncProfileMenu(
+                "Driver 1", rHideVirtualRadio.updatedMenuJson, showAll, installedPkgRadioOnly, radioBak);
+        checkTrue("@class/Radio restores instead of dropping backup", rRestoreVirtualRadio.updatedMenuJson != null);
+        checkTrue("restored menu contains Radio class", rRestoreVirtualRadio.updatedMenuJson.contains("\"className\":\"Radio\""));
+
+        // Multi-profile owner union (Driver 1 + custom-named Sam) + empty-profile fallback + Driver 2 custom APK discovery
+        Map<String, String> mixedOwners = new LinkedHashMap<String, String>();
+        String driver2WithCustomApk = "{\"menuItems\":["
+                + "{\"packageName\":\"com.naver.vibe\",\"itemId\":31,\"className\":\".MainActivity\"},"
+                + "{\"packageName\":\"org.videolan.vlc\",\"itemId\":1,\"className\":\"org.videolan.vlc.StartActivity\"}"
+                + "]}";
+        mixedOwners.put("Driver1", sampleGrid());
+        mixedOwners.put("Sam", i5Menu);
+        mixedOwners.put("Driver 2", driver2WithCustomApk);
+        mixedOwners.put("Guest", unprunedFactoryProfile);
+        List<String> selectedMixed = TileStore.selectProfileMenuJsons(mixedOwners);
+        check("Driver1 + Sam unions both owner profiles (omits Driver 2 & Guest)",
+                Integer.valueOf(2), Integer.valueOf(selectedMixed.size()));
+        TileStore.MenuInventory mixedInv = TileStore.collectMenuInventory(
+                selectedMixed, TileStore.collectNonGuestMenuJsons(mixedOwners), null);
+        check("unpruned Driver 2 VIBE excluded from equippedKeys", Boolean.FALSE,
+                Boolean.valueOf(mixedInv.equippedKeys.contains("com.naver.vibe/com.naver.vibe.MainActivity")));
+        boolean foundDriver2Vlc = false;
+        for (TileStore.MenuEntryRecord rec : mixedInv.allNonGuestEntries) {
+            if ("org.videolan.vlc".equals(rec.packageName)) foundDriver2Vlc = true;
+        }
+        checkTrue("Driver 2 custom APK discovered in allNonGuestEntries", foundDriver2Vlc);
+
+        Map<String, String> emptyDriver1Profiles = new LinkedHashMap<String, String>();
+        emptyDriver1Profiles.put("Driver 1",
+                "{\"menuItems\":[{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"}]}");
+        emptyDriver1Profiles.put("Driver 2", i5Menu);
+        List<String> fallbackToDriver2 = TileStore.selectProfileMenuJsons(emptyDriver1Profiles);
+        check("empty Driver 1 falls back to non-Guest profiles",
+                Integer.valueOf(2), Integer.valueOf(fallbackToDriver2.size()));
+
+        // Orphan re-seating (Show All / single-tile unhide when a prior version left Empty view without backup.json)
+        String orphanedMenu = "{\"menuItems\":["
+                + "{\"packageName\":\"\",\"itemId\":8,\"className\":\"Radio\"},"
+                + "{\"packageName\":\"com.mnsoft.navi\",\"itemId\":2,\"className\":\"\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"},"
+                + "{\"packageName\":\"com.android.settings\",\"itemId\":20,\"className\":\"\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"}"
+                + "]}";
+        List<TileStore.ReconcileTile> reconcileAll = new ArrayList<TileStore.ReconcileTile>();
+        // Already placed via @class/Radio, com.mnsoft.navi/*, and com.android.settings/* -> MUST NOT duplicate!
+        reconcileAll.add(new TileStore.ReconcileTile(
+                "com.hkmc.radio/com.hkmc.radio.RadioActivity", "com.hkmc.radio", "com.hkmc.radio.RadioActivity", "Radio", -1));
+        reconcileAll.add(new TileStore.ReconcileTile(
+                "com.mnsoft.navi/com.mnsoft.navi.NaviMenuActivity", "com.mnsoft.navi", "com.mnsoft.navi.NaviMenuActivity", "Navigation Menu", -1));
+        reconcileAll.add(new TileStore.ReconcileTile(
+                "com.android.settings/com.android.settings.Settings", "com.android.settings", "com.android.settings.Settings", "Setup", -1));
+        // Truly orphaned tiles missing from both all_menu and backup.json -> MUST re-seat into Empty view slots!
+        reconcileAll.add(new TileStore.ReconcileTile(
+                "com.hkmc.qrmanual/com.hkmc.qrmanual.QRManualActivity", "com.hkmc.qrmanual", "com.hkmc.qrmanual.QRManualActivity", "User's Manual", 15));
+        reconcileAll.add(new TileStore.ReconcileTile(
+                "com.ivi.notification/com.ivi.notification.NoticeActivity", "com.ivi.notification", "com.ivi.notification.NoticeActivity", "Notifications", 12));
+
+        Map<String, Object> emptyBackups = new LinkedHashMap<String, Object>();
+        TileStore.InstallChecker allInstalled = new TileStore.InstallChecker() {
+            @Override
+            public boolean isBackupStillInstalled(String backupKey, String pkg, String cls, int itemId) {
+                return true;
+            }
+        };
+        TileStore.Config showAllNoCompact = new TileStore.Config(true, false, Collections.<String>emptySet());
+        TileStore.SyncResult reseated = TileStore.syncProfileMenu(
+                "Driver 1", orphanedMenu, showAllNoCompact, allInstalled, emptyBackups, reconcileAll, multiPkgs);
+        checkTrue("Show All re-seats orphaned tiles even when backup.json is empty", reseated.updatedMenuJson != null);
+        check("slot 0 remains Radio (not duplicated)", "", slotPkg(reseated.updatedMenuJson, 0));
+        check("slot 1 remains Navigation Menu", "com.mnsoft.navi", slotPkg(reseated.updatedMenuJson, 1));
+        check("slot 2 re-seats orphaned User's Manual", "com.hkmc.qrmanual", slotPkg(reseated.updatedMenuJson, 2));
+        check("slot 2 preserves itemId 15", Integer.valueOf(15), Integer.valueOf(slotItemId(reseated.updatedMenuJson, 2)));
+        check("slot 3 remains Setup", "com.android.settings", slotPkg(reseated.updatedMenuJson, 3));
+        check("slot 4 re-seats orphaned Notifications", "com.ivi.notification", slotPkg(reseated.updatedMenuJson, 4));
+
+        // 19. v1.0.5 reordering: stock Edit Home Icons compatibility, event-driven gap compaction,
+        //     FilterableMenuList order preservation across Dalvik/JDK mutations, and lossless reorderProfileMenu
+        Map<String, Object> stockEditBackups = new LinkedHashMap<String, Object>();
+        TileStore.Config hideRadioAndComfortCompact = new TileStore.Config(true, true, setOf(
+                "com.hkmc.radio/com.hkmc.radio.RadioActivity",
+                "dev.lemoyne.comfort/dev.lemoyne.comfort.MainActivity"));
+        TileStore.SyncResult initialHideCompact = TileStore.syncProfileMenu(
+                "Driver 1", sampleGrid(), hideRadioAndComfortCompact, installed, stockEditBackups);
+        checkTrue("initial hide with compactGaps=true compacts grid", initialHideCompact.updatedMenuJson != null);
+
+        // User opens stock Edit Home Icons, swaps HMG-API before EV, and leaves an intentional
+        // Empty view spacer in slot 1 (e.g. pushing EV to the next page/column).
+        String stockEditedWithSpacer = "{\"menuItems\":["
+                + "{\"packageName\":\"hmgapi.app\",\"itemId\":9000,\"className\":\"hmgapi.app.MainActivity\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"},"
+                + "{\"packageName\":\"com.hkmc.ev\",\"itemId\":3,\"className\":\"com.hkmc.ev.EvActivity\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"}"
+                + "]}";
+        TileStore.SyncResult passiveReload = TileStore.syncProfileMenu(
+                "Driver 1", stockEditedWithSpacer, hideRadioAndComfortCompact, installed, stockEditBackups);
+        check("passive Launcher_WP3 reload preserves stock Edit Home Icons order & multi-page spacer",
+                null, passiveReload.updatedMenuJson);
+
+        // On reboot, HmgApi.syncSavedMenu temporarily re-inserts already-backed-up hidden Comfort (9001)
+        // into trailing slot 3; syncProfileMenu must clear ONLY slot 3 without collapsing slot 1's spacer!
+        String rebootTransientModInsert = "{\"menuItems\":["
+                + "{\"packageName\":\"hmgapi.app\",\"itemId\":9000,\"className\":\"hmgapi.app.MainActivity\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"},"
+                + "{\"packageName\":\"com.hkmc.ev\",\"itemId\":3,\"className\":\"com.hkmc.ev.EvActivity\"},"
+                + "{\"packageName\":\"dev.lemoyne.comfort\",\"itemId\":9001,\"className\":\"dev.lemoyne.comfort.MainActivity\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"}"
+                + "]}";
+        TileStore.SyncResult rebootCleared = TileStore.syncProfileMenu(
+                "Driver 1", rebootTransientModInsert, hideRadioAndComfortCompact, installed, stockEditBackups);
+        checkTrue("reboot transient hidden mod slot is cleared", rebootCleared.updatedMenuJson != null);
+        check("reboot preserves HMG-API at slot 0", "hmgapi.app", slotPkg(rebootCleared.updatedMenuJson, 0));
+        check("reboot preserves intentional Empty view spacer at slot 1",
+                "Empty view", slotPkg(rebootCleared.updatedMenuJson, 1));
+        check("reboot preserves EV at slot 2", "com.hkmc.ev", slotPkg(rebootCleared.updatedMenuJson, 2));
+        check("reboot clears transient Comfort at slot 3", "Empty view", slotPkg(rebootCleared.updatedMenuJson, 3));
+
+        // Explicit forceCompact=true (toggling Close Empty Gaps ON in Tile Manager) compacts gaps on demand
+        TileStore.SyncResult explicitCompact = TileStore.syncProfileMenu(
+                "Driver 1", stockEditedWithSpacer, hideRadioAndComfortCompact,
+                null, stockEditBackups, null, null, true);
+        checkTrue("forceCompact=true closes empty gaps on demand", explicitCompact.updatedMenuJson != null);
+        check("forceCompact keeps swapped HMG-API first at slot 0",
+                "hmgapi.app", slotPkg(explicitCompact.updatedMenuJson, 0));
+        check("forceCompact packs EV left into slot 1",
+                "com.hkmc.ev", slotPkg(explicitCompact.updatedMenuJson, 1));
+        check("forceCompact trails Empty view at slot 2",
+                "Empty view", slotPkg(explicitCompact.updatedMenuJson, 2));
+
+        // FilterableMenuList order preservation across Collections.swap, remove+add, Dalvik ListIterator.set,
+        // Collections.sort, clear+addAll, and identity deduplication while retaining hidden items
+        final Set<String> orderHidden = new LinkedHashSet<String>(Collections.singletonList("B_HIDDEN"));
+        TileStore.ItemVisibilityFilter orderFilter = new TileStore.ItemVisibilityFilter() {
+            @Override
+            public void onItemAdded(Object item) {}
+            @Override
+            public boolean shouldShow(Object item) {
+                return !orderHidden.contains(String.valueOf(item));
+            }
+        };
+        String tokA = new String("A_EV");
+        String tokHidden = new String("B_HIDDEN");
+        String tokC = new String("C_COMFORT");
+        String tokD = new String("D_HMGAPI");
+        TileStore.FilterableMenuList orderList = new TileStore.FilterableMenuList(
+                Arrays.<Object>asList(tokA, tokHidden, tokC, tokD), orderFilter);
+        check("initial visible order", Arrays.<Object>asList(tokA, tokC, tokD), new ArrayList<Object>(orderList));
+        check("duplicate identity add ignored", Boolean.FALSE, Boolean.valueOf(orderList.add(tokA)));
+
+        // 1) Collections.swap (invokes set(int, Object)) + refilter
+        Collections.swap(orderList, 0, 2);
+        orderList.refilter(orderFilter);
+        check("Collections.swap order survives refilter",
+                Arrays.<Object>asList(tokD, tokC, tokA), new ArrayList<Object>(orderList));
+        checkTrue("hidden item retained in snapshotRaw after swap",
+                orderList.snapshotRaw().contains(tokHidden));
+
+        // 2) Drag-drop remove(int) + add(int, Object) + refilter
+        Object dragged = orderList.remove(2); // tokA
+        orderList.add(0, dragged);
+        orderList.refilter(orderFilter);
+        check("remove(int)+add(int,Object) order survives refilter",
+                Arrays.<Object>asList(tokA, tokD, tokC), new ArrayList<Object>(orderList));
+        checkTrue("hidden item retained in snapshotRaw after drag-insert",
+                orderList.snapshotRaw().contains(tokHidden));
+
+        // 3) Simulate Android 4.4 KitKat Dalvik Collections.sort via direct ListIterator.set mutations
+        ListIterator<Object> lit = orderList.listIterator();
+        lit.next();
+        lit.set(tokC);
+        lit.next();
+        lit.set(tokA);
+        lit.next();
+        lit.set(tokD);
+        orderList.refilter(orderFilter);
+        check("ListIterator.set (Dalvik Collections.sort path) order survives refilter",
+                Arrays.<Object>asList(tokC, tokA, tokD), new ArrayList<Object>(orderList));
+
+        // Unhide B_HIDDEN: all 4 items appear with zero duplicates and C, A, D relative order preserved
+        orderHidden.clear();
+        orderList.refilter(orderFilter);
+        check("unhiding restores all 4 items without duplicates",
+                Integer.valueOf(4), Integer.valueOf(orderList.size()));
+        check("unhiding preserves sorted relative order [tokC, tokA, tokHidden, tokD]",
+                Arrays.<Object>asList(tokC, tokA, tokHidden, tokD), new ArrayList<Object>(orderList));
+
+        // 4) Standard Collections.sort + refilter
+        Collections.sort(orderList, new Comparator<Object>() {
+            @Override
+            public int compare(Object o1, Object o2) {
+                return String.valueOf(o2).compareTo(String.valueOf(o1));
+            }
+        });
+        orderList.refilter(orderFilter);
+        check("Collections.sort descending survives refilter",
+                Arrays.<Object>asList(tokD, tokC, tokHidden, tokA), new ArrayList<Object>(orderList));
+
+        // 5) Adapter-style clear() + addAll(reorderedCopy)
+        List<Object> reorderedCopy = Arrays.<Object>asList(tokA, tokD);
+        orderList.clear();
+        orderList.addAll(reorderedCopy);
+        check("clear() + addAll() repopulates exact visible order",
+                reorderedCopy, new ArrayList<Object>(orderList));
+
+        // parseProfileSlots + lossless reorderProfileMenu (cross-representation keys, @empty spacers,
+        // 9000+ mod IDs, unmentioned placed retention, overflow guard, and compactGaps stripping)
+        String arrangeGrid = "{\"menuItems\":["
+                + "{\"packageName\":\"\",\"itemId\":8,\"className\":\"Radio\"},"
+                + "{\"packageName\":\"com.mnsoft.navi\",\"itemId\":2,\"className\":\"\"},"
+                + "{\"packageName\":\"com.android.settings\",\"itemId\":20,\"className\":\"\"},"
+                + "{\"packageName\":\"dev.lemoyne.comfort\",\"itemId\":9001,\"className\":\"dev.lemoyne.comfort.MainActivity\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"}"
+                + "]}";
+        List<TileStore.ProfileSlot> parsedSlots = TileStore.parseProfileSlots(arrangeGrid);
+        check("parseProfileSlots count", Integer.valueOf(6), Integer.valueOf(parsedSlots.size()));
+        check("parseProfileSlots slot 0 virtual Radio key", "@class/Radio", parsedSlots.get(0).key);
+        check("parseProfileSlots slot 1 pkg/* Navi key", "com.mnsoft.navi/*", parsedSlots.get(1).key);
+        check("parseProfileSlots slot 4 @empty token", TileStore.EMPTY_SLOT_TOKEN, parsedSlots.get(4).key);
+        checkTrue("parseProfileSlots slot 4 empty flag", parsedSlots.get(4).empty);
+
+        // Reorder using catalog-form keys + intentional @empty spacer (Leaving Setup unmentioned to verify zero-loss!)
+        List<String> desiredWithSpacer = Arrays.asList(
+                "dev.lemoyne.comfort/dev.lemoyne.comfort.MainActivity",
+                TileStore.EMPTY_SLOT_TOKEN,
+                "com.mnsoft.navi/com.mnsoft.navi.NaviMenuActivity",
+                "com.hkmc.radio/com.hkmc.radio.RadioActivity");
+        TileStore.SyncResult reorderedSpaced = TileStore.reorderProfileMenu(
+                "Driver 1", arrangeGrid, desiredWithSpacer, false);
+        checkTrue("reorderProfileMenu produces updated JSON", reorderedSpaced.updatedMenuJson != null);
+        check("reordered slot 0 is Comfort", "dev.lemoyne.comfort", slotPkg(reorderedSpaced.updatedMenuJson, 0));
+        check("reordered slot 0 keeps mod itemId 9001",
+                Integer.valueOf(9001), Integer.valueOf(slotItemId(reorderedSpaced.updatedMenuJson, 0)));
+        check("reordered slot 1 respects @empty spacer",
+                "Empty view", slotPkg(reorderedSpaced.updatedMenuJson, 1));
+        check("reordered slot 2 matches pkg/* Navi from full catalog key",
+                "com.mnsoft.navi", slotPkg(reorderedSpaced.updatedMenuJson, 2));
+        check("reordered slot 2 preserves Navi itemId 2",
+                Integer.valueOf(2), Integer.valueOf(slotItemId(reorderedSpaced.updatedMenuJson, 2)));
+        check("reordered slot 3 matches @class/Radio from com.hkmc.radio catalog key",
+                "", slotPkg(reorderedSpaced.updatedMenuJson, 3));
+        check("reordered slot 3 preserves Radio itemId 8",
+                Integer.valueOf(8), Integer.valueOf(slotItemId(reorderedSpaced.updatedMenuJson, 3)));
+        check("reordered slot 4 retains unmentioned Setup without losing tile",
+                "com.android.settings", slotPkg(reorderedSpaced.updatedMenuJson, 4));
+        check("reordered slot 5 pads trailing Empty view",
+                "Empty view", slotPkg(reorderedSpaced.updatedMenuJson, 5));
+
+        // Idempotent no-op when desired order matches current layout
+        List<String> sameOrderTokens = new ArrayList<String>();
+        for (TileStore.ProfileSlot ps : TileStore.parseProfileSlots(reorderedSpaced.updatedMenuJson)) {
+            sameOrderTokens.add(ps.key);
+        }
+        TileStore.SyncResult reorderNoOp = TileStore.reorderProfileMenu(
+                "Driver 1", reorderedSpaced.updatedMenuJson, sameOrderTokens, false);
+        check("reorderProfileMenu no-op returns null updatedMenuJson", null, reorderNoOp.updatedMenuJson);
+
+        // Overflow guard: excessive @empty tokens cannot push placed tiles off a 6-slot grid
+        List<String> overflowSpacers = Arrays.asList(
+                TileStore.EMPTY_SLOT_TOKEN, TileStore.EMPTY_SLOT_TOKEN,
+                TileStore.EMPTY_SLOT_TOKEN, TileStore.EMPTY_SLOT_TOKEN,
+                "dev.lemoyne.comfort/dev.lemoyne.comfort.MainActivity");
+        TileStore.SyncResult overflowSafe = TileStore.reorderProfileMenu(
+                "Driver 1", arrangeGrid, overflowSpacers, false);
+        List<TileStore.ProfileSlot> overflowSlots = TileStore.parseProfileSlots(overflowSafe.updatedMenuJson);
+        check("overflow guard preserves 6 total slots", Integer.valueOf(6), Integer.valueOf(overflowSlots.size()));
+        int placedAfterOverflow = 0;
+        for (TileStore.ProfileSlot ps : overflowSlots) {
+            if (!ps.empty) placedAfterOverflow++;
+        }
+        check("overflow guard loses zero placed tiles (all 4 kept)",
+                Integer.valueOf(4), Integer.valueOf(placedAfterOverflow));
+
+        // compactGaps=true strips @empty spacers and packs tiles tightly left
+        TileStore.SyncResult reorderedCompacted = TileStore.reorderProfileMenu(
+                "Driver 1", reorderedSpaced.updatedMenuJson, sameOrderTokens, true);
+        checkTrue("reorderProfileMenu with compactGaps=true strips spacer", reorderedCompacted.updatedMenuJson != null);
+        check("compacted reorder slot 0 Comfort", "dev.lemoyne.comfort", slotPkg(reorderedCompacted.updatedMenuJson, 0));
+        check("compacted reorder slot 1 Navi (spacer stripped)", "com.mnsoft.navi", slotPkg(reorderedCompacted.updatedMenuJson, 1));
+        check("compacted reorder slot 2 Radio", "", slotPkg(reorderedCompacted.updatedMenuJson, 2));
+        check("compacted reorder slot 3 Setup", "com.android.settings", slotPkg(reorderedCompacted.updatedMenuJson, 3));
+        check("compacted reorder slot 4 Empty view", "Empty view", slotPkg(reorderedCompacted.updatedMenuJson, 4));
 
         System.out.println("TileStoreTest: " + checks + " checks passed");
     }

@@ -18,6 +18,11 @@ has "hooks.jar contains TileModEntry" "Ldev/lemoyne/tiles/hook/TileModEntry;" "$
 has "hooks.jar contains TileStore" "Ldev/lemoyne/tiles/hook/TileStore;" "$HOOK_STRINGS"
 has "hooks.jar contains FilterableMenuList" "Ldev/lemoyne/tiles/hook/TileStore\$FilterableMenuList;" "$HOOK_STRINGS"
 has "hooks.jar contains EntryInspector" "Ldev/lemoyne/tiles/hook/TileStore\$EntryInspector;" "$HOOK_STRINGS"
+has "hooks.jar contains InstallChecker" "Ldev/lemoyne/tiles/hook/TileStore\$InstallChecker;" "$HOOK_STRINGS"
+has "hooks.jar contains ReconcileTile" "Ldev/lemoyne/tiles/hook/TileStore\$ReconcileTile;" "$HOOK_STRINGS"
+has "hooks.jar contains ProfileSlot" "Ldev/lemoyne/tiles/hook/TileStore\$ProfileSlot;" "$HOOK_STRINGS"
+has "hooks.jar contains reorderProfileMenu" "reorderProfileMenu" "$HOOK_STRINGS"
+has "hooks.jar contains ACTION_OPEN_STOCK_EDITOR" "dev.lemoyne.tiles.ACTION_OPEN_STOCK_EDITOR" "$HOOK_STRINGS"
 
 APK_STRINGS=$(unzip -p "$B/app/TileManager.apk" classes.dex | strings)
 has "apk contains MainActivity" "Ldev/lemoyne/tiles/MainActivity;" "$APK_STRINGS"
@@ -28,7 +33,11 @@ has "apk contains TileWidgets" "Ldev/lemoyne/tiles/TileWidgets;" "$APK_STRINGS"
 has "apk contains SystemIconResolver" "Ldev/lemoyne/tiles/SystemIconResolver;" "$APK_STRINGS"
 has "apk bundles HmgApi client" "Lhmgapi/client/HmgApi;" "$APK_STRINGS"
 has "apk contains refreshCatalog" "refreshCatalog" "$APK_STRINGS"
+has "apk contains force_restore_all" "force_restore_all" "$APK_STRINGS"
+has "apk contains ACTION_OPEN_STOCK_EDITOR" "dev.lemoyne.tiles.ACTION_OPEN_STOCK_EDITOR" "$APK_STRINGS"
+has "apk contains Edit Home Icons button" "Edit Home Icons" "$APK_STRINGS"
 has "apk contains author credit" "by lemoyneiv" "$APK_STRINGS"
+has "apk contains v1.0.5 header" "v1.0.5" "$APK_STRINGS"
 
 HOOK_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/src/dev/lemoyne/tiles/hook/TileStore.java" | head -n 1)
 APP_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/app/java/dev/lemoyne/tiles/TileCatalogProvider.java" | head -n 1)

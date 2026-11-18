@@ -35,16 +35,17 @@ import java.util.Set;
 /**
  * Lightweight IPC ContentProvider bridging com.android.launcher3, com.hkmc.system.app.homesetting,
  * and the Tile Manager UI on stock Open-HMG/HMG-API without requiring any core daemon changes:
- *  - putCatalog / getCatalog / refreshCatalog: live schema-4 catalog of equipped stock + custom/mod tiles
+ *  - putCatalog / getCatalog / refreshCatalog: live schema-5 catalog of equipped stock + custom/mod tiles
  *  - getConfig / putConfig: instant cross-process tile visibility & gap-compaction settings
  */
 public final class TileCatalogProvider extends ContentProvider {
-    static final int CATALOG_SCHEMA = 4;
+    static final int CATALOG_SCHEMA = 5;
     static final String AUTHORITY = "dev.lemoyne.tiles.provider";
     static final Uri URI = Uri.parse("content://" + AUTHORITY);
     static final Uri ALL_MENU = Uri.parse("content://com.hkmc.system.app.homesetting.provider/all_menu");
     static final String ACTION_TILES_CHANGED = "dev.lemoyne.tiles.ACTION_TILES_CHANGED";
     static final String ACTION_REQUEST_CATALOG = "dev.lemoyne.tiles.ACTION_REQUEST_CATALOG";
+    static final String ACTION_OPEN_STOCK_EDITOR = "dev.lemoyne.tiles.ACTION_OPEN_STOCK_EDITOR";
 
     private static final String CATALOG_FILE = "catalog.json";
     private static final String CONFIG_FILE = "config.json";
@@ -205,11 +206,14 @@ public final class TileCatalogProvider extends ContentProvider {
             Set<String> coveredSystemTitles = new LinkedHashSet<String>();
             Set<String> activeMenuKeys = new LinkedHashSet<String>();
             Set<String> activeMenuPackages = new LinkedHashSet<String>();
+            Set<Integer> activeMenuItemIds = new LinkedHashSet<Integer>();
             Map<String, JSONObject> menuRecords = new LinkedHashMap<String, JSONObject>();
+            Map<String, JSONObject> nonGuestMenuRecords = new LinkedHashMap<String, JSONObject>();
             Map<String, String> modByPkg = readModPackagesMap();
 
-            // 1. Read ALL_MENU preferring custom-renamed owner profiles, then Driver 1, then
-            //    non-Guest profiles so unpruned factory Guest/Driver 2 rows do not inject ghosts.
+            // 1. Read ALL_MENU unioning custom-renamed owner profiles + Driver 1 (falling back to
+            //    non-Guest profiles if owner profiles have no placed tiles) so unpruned factory
+            //    Guest/Driver 2 rows do not inject ghosts while neither owner profile shadows the other.
             List<String> customNamedJsons = new ArrayList<String>();
             List<String> driver1Jsons = new ArrayList<String>();
             List<String> nonGuestJsons = new ArrayList<String>();
@@ -227,12 +231,14 @@ public final class TileCatalogProvider extends ContentProvider {
                         allJsons.add(json);
                         if ("Guest".equalsIgnoreCase(user)) continue;
                         nonGuestJsons.add(json);
-                        if ("Driver 1".equalsIgnoreCase(user) || "User 1".equalsIgnoreCase(user)
-                                || "User1".equalsIgnoreCase(user)) {
+                        if ("Driver 1".equalsIgnoreCase(user) || "Driver1".equalsIgnoreCase(user)
+                                || "User 1".equalsIgnoreCase(user) || "User1".equalsIgnoreCase(user)) {
                             driver1Jsons.add(json);
                         } else if (!user.isEmpty()
-                                && !"Driver 2".equalsIgnoreCase(user) && !"User 2".equalsIgnoreCase(user) && !"User2".equalsIgnoreCase(user)
-                                && !"Driver 3".equalsIgnoreCase(user) && !"User 3".equalsIgnoreCase(user) && !"User3".equalsIgnoreCase(user)) {
+                                && !"Driver 2".equalsIgnoreCase(user) && !"Driver2".equalsIgnoreCase(user)
+                                && !"User 2".equalsIgnoreCase(user) && !"User2".equalsIgnoreCase(user)
+                                && !"Driver 3".equalsIgnoreCase(user) && !"Driver3".equalsIgnoreCase(user)
+                                && !"User 3".equalsIgnoreCase(user) && !"User3".equalsIgnoreCase(user)) {
                             customNamedJsons.add(json);
                         }
                     }
@@ -242,9 +248,12 @@ public final class TileCatalogProvider extends ContentProvider {
                 if (cur != null) cur.close();
             }
 
-            List<String> chosenJsons = !customNamedJsons.isEmpty() ? customNamedJsons
-                    : (!driver1Jsons.isEmpty() ? driver1Jsons
-                    : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons));
+            List<String> ownerJsons = new ArrayList<String>(customNamedJsons.size() + driver1Jsons.size());
+            ownerJsons.addAll(customNamedJsons);
+            ownerJsons.addAll(driver1Jsons);
+            List<String> chosenJsons = (!ownerJsons.isEmpty() && hasPlacedMenuItems(ownerJsons))
+                    ? ownerJsons
+                    : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons);
             for (String json : chosenJsons) {
                 try {
                     JSONObject root = new JSONObject(json);
@@ -262,7 +271,30 @@ public final class TileCatalogProvider extends ContentProvider {
                         if (key.isEmpty()) continue;
                         activeMenuKeys.add(key);
                         if (!pkg.isEmpty()) activeMenuPackages.add(pkg);
+                        if (id > 0 && id != 39) activeMenuItemIds.add(Integer.valueOf(id));
                         if (!menuRecords.containsKey(key)) menuRecords.put(key, it);
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            nonGuestMenuRecords.putAll(menuRecords);
+            for (String json : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons)) {
+                try {
+                    JSONObject root = new JSONObject(json);
+                    JSONArray items = root.optJSONArray("menuItems");
+                    if (items == null) continue;
+                    for (int i = 0; i < items.length(); i++) {
+                        JSONObject it = items.optJSONObject(i);
+                        if (it == null) continue;
+                        String pkg = clean(it.optString("packageName", ""));
+                        String cls = clean(it.optString("className", ""));
+                        int id = it.optInt("itemId", -1);
+                        if ("Empty view".equals(pkg) || "Empty view".equals(cls)) continue;
+                        if (pkg.isEmpty() && cls.isEmpty() && (id <= 0 || id == 39)) continue;
+                        String key = normKey(pkg, cls, id);
+                        if (!key.isEmpty() && !nonGuestMenuRecords.containsKey(key)) {
+                            nonGuestMenuRecords.put(key, it);
+                        }
                     }
                 } catch (Throwable ignored) {}
             }
@@ -310,32 +342,35 @@ public final class TileCatalogProvider extends ContentProvider {
                         if (row == null) continue;
                         String pkg = clean(row.optString("packageName", ""));
                         String cls = clean(row.optString("className", ""));
+                        int itemId = row.optInt("itemId", -1);
                         String key = normKeyString(row.optString("key", ""));
-                        if (key.isEmpty()) key = normKey(pkg, cls, -1);
+                        if (key.isEmpty()) key = normKey(pkg, cls, itemId);
                         if (key.isEmpty()) continue;
                         String title = clean(row.optString("title", ""));
                         String modId = modByPkg.get(pkg);
                         if (modId == null) {
                             if ("hmgapi.app".equals(pkg) || pkg.startsWith("hmgapi.")) modId = "hmgapi";
-                            else if (isNemesisTile(pkg, title, -1)) modId = "nemesis";
+                            else if (isNemesisTile(pkg, title, itemId)) modId = "nemesis";
                         }
-                        String kind = classifyKind(ctx, pkg, title, -1, modId);
+                        String kind = classifyKind(ctx, pkg, title, itemId, modId);
+                        String finalTitle = "system".equals(kind) ? friendlyTitle(title, pkg, cls) : title;
                         if ("system".equals(kind)) {
                             if (!isTargetComponentInstalled(ctx, pkg, cls)) continue;
-                            if (!isSupportedStockFeature(ctx, title, pkg, cls)) continue;
-                            if (hasMenuFilter && !isEquippedInMenu(key, pkg, cls, activeMenuKeys,
-                                    activeMenuPackages, multiEntryPackages)
-                                    && !isKeyHidden(hidden, key, pkg, cls, -1)) {
+                            if (!isSupportedStockFeature(ctx, finalTitle, pkg, cls)) continue;
+                            if (hasMenuFilter
+                                    && !isEquippedInMenu(key, pkg, cls, itemId, activeMenuKeys,
+                                            activeMenuPackages, activeMenuItemIds, multiEntryPackages)
+                                    && !isUnconditionalCoreStockTile(finalTitle, pkg, cls)
+                                    && !isKeyHidden(hidden, key, pkg, cls, itemId)) {
                                 continue;
                             }
                         }
-                        String finalTitle = "system".equals(kind) ? friendlyTitle(title, pkg, cls) : title;
                         String iconPkg = clean(row.optString("iconPkg", ""));
                         String iconType = clean(row.optString("iconType", ""));
                         String iconName = clean(row.optString("iconName", ""));
                         int iconId = row.optInt("iconId", 0);
                         putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
-                                key, pkg, cls, finalTitle, kind, modId,
+                                key, pkg, cls, finalTitle, kind, modId, itemId,
                                 iconPkg, iconType, iconName, iconId);
                     }
                 }
@@ -384,7 +419,7 @@ public final class TileCatalogProvider extends ContentProvider {
             }
 
             // 4. Add remaining equipped tiles from ALL_MENU (recovers stock apps restored via
-            //    Show All or missing from a pre-v1.0.3 catalog while deduplicating covered packages)
+            //    Show All or missing from an earlier catalog while deduplicating covered packages)
             for (Map.Entry<String, JSONObject> e : menuRecords.entrySet()) {
                 String key = e.getKey();
                 if (byKey.containsKey(key)) continue;
@@ -416,7 +451,31 @@ public final class TileCatalogProvider extends ContentProvider {
                     if (!isSupportedStockFeature(ctx, finalTitle, pkg, cls)) continue;
                 }
                 putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
-                        key, pkg, cls, finalTitle, kind, modId);
+                        key, pkg, cls, finalTitle, kind, modId, id, "", "", "", 0);
+            }
+
+            // 4b. Discover custom/sideloaded package tiles across non-Guest secondary profiles (e.g. Driver 2)
+            for (Map.Entry<String, JSONObject> e : nonGuestMenuRecords.entrySet()) {
+                String key = e.getKey();
+                if (byKey.containsKey(key)) continue;
+                JSONObject it = e.getValue();
+                String pkg = clean(it.optString("packageName", ""));
+                if (pkg.isEmpty() || !isPackageInstalled(ctx, pkg)) continue;
+                if (byKey.containsKey(pkg + "/*")) continue;
+                if (!multiEntryPackages.contains(pkg) && coveredPackages.contains(pkg)) continue;
+                String cls = clean(it.optString("className", ""));
+                int id = it.optInt("itemId", -1);
+                String label = resolveAppLabel(ctx, pkg, cls);
+                String modId = modByPkg.get(pkg);
+                if (modId == null) {
+                    if ("hmgapi.app".equals(pkg) || pkg.startsWith("hmgapi.")) modId = "hmgapi";
+                    else if (isNemesisTile(pkg, label, id)) modId = "nemesis";
+                }
+                String kind = classifyKind(ctx, pkg, label, id, modId);
+                if ("package".equals(kind)) {
+                    putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
+                            key, pkg, cls, label, kind, modId, id, "", "", "", 0);
+                }
             }
 
             if (byKey.isEmpty()) return null;
@@ -432,16 +491,38 @@ public final class TileCatalogProvider extends ContentProvider {
         }
     }
 
-    private static void putCatalogRow(Map<String, JSONObject> byKey, Set<String> coveredPackages,
-                                      Set<String> coveredSystemTitles, String key, String pkg,
-                                      String cls, String title, String kind, String modId) throws Exception {
-        putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
-                key, pkg, cls, title, kind, modId, "", "", "", 0);
+    private static boolean hasPlacedMenuItems(List<String> menuJsons) {
+        if (menuJsons == null) return false;
+        for (String json : menuJsons) {
+            if (json == null || json.isEmpty()) continue;
+            try {
+                JSONArray items = new JSONObject(json).optJSONArray("menuItems");
+                if (items == null) continue;
+                for (int i = 0; i < items.length(); i++) {
+                    JSONObject it = items.optJSONObject(i);
+                    if (it == null) continue;
+                    String pkg = clean(it.optString("packageName", ""));
+                    String cls = clean(it.optString("className", ""));
+                    int id = it.optInt("itemId", -1);
+                    if ("Empty view".equals(pkg) || "Empty view".equals(cls)) continue;
+                    if (pkg.isEmpty() && cls.isEmpty() && (id <= 0 || id == 39)) continue;
+                    return true;
+                }
+            } catch (Throwable ignored) {}
+        }
+        return false;
     }
 
     private static void putCatalogRow(Map<String, JSONObject> byKey, Set<String> coveredPackages,
                                       Set<String> coveredSystemTitles, String key, String pkg,
-                                      String cls, String title, String kind, String modId,
+                                      String cls, String title, String kind, String modId) throws Exception {
+        putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
+                key, pkg, cls, title, kind, modId, -1, "", "", "", 0);
+    }
+
+    private static void putCatalogRow(Map<String, JSONObject> byKey, Set<String> coveredPackages,
+                                      Set<String> coveredSystemTitles, String key, String pkg,
+                                      String cls, String title, String kind, String modId, int itemId,
                                       String iconPkg, String iconType, String iconName, int iconId) throws Exception {
         if (key == null || key.isEmpty() || byKey.containsKey(key)) return;
         JSONObject priorWildcard = null;
@@ -454,11 +535,16 @@ public final class TileCatalogProvider extends ContentProvider {
             }
             coveredPackages.add(pkg);
         }
-        if (priorWildcard != null && (iconName == null || iconName.isEmpty()) && iconId == 0) {
-            iconPkg = clean(priorWildcard.optString("iconPkg", ""));
-            iconType = clean(priorWildcard.optString("iconType", ""));
-            iconName = clean(priorWildcard.optString("iconName", ""));
-            iconId = priorWildcard.optInt("iconId", 0);
+        if (priorWildcard != null) {
+            if ((iconName == null || iconName.isEmpty()) && iconId == 0) {
+                iconPkg = clean(priorWildcard.optString("iconPkg", ""));
+                iconType = clean(priorWildcard.optString("iconType", ""));
+                iconName = clean(priorWildcard.optString("iconName", ""));
+                iconId = priorWildcard.optInt("iconId", 0);
+            }
+            if (itemId <= 0 || itemId == 39) {
+                itemId = priorWildcard.optInt("itemId", -1);
+            }
         }
         JSONObject row = new JSONObject();
         row.put("key", key);
@@ -467,6 +553,7 @@ public final class TileCatalogProvider extends ContentProvider {
         row.put("title", title);
         row.put("kind", kind);
         if (modId != null) row.put("mod", modId);
+        if (itemId > 0 && itemId != 39) row.put("itemId", itemId);
         if (iconPkg != null && !iconPkg.isEmpty()) row.put("iconPkg", iconPkg);
         if (iconType != null && !iconType.isEmpty()) row.put("iconType", iconType);
         if (iconName != null && !iconName.isEmpty()) row.put("iconName", iconName);
@@ -495,20 +582,84 @@ public final class TileCatalogProvider extends ContentProvider {
         return false;
     }
 
-    private static boolean isEquippedInMenu(String key, String pkg, String cls,
+    private static boolean isEquippedInMenu(String key, String pkg, String cls, int itemId,
                                             Set<String> activeMenuKeys, Set<String> activeMenuPackages,
+                                            Set<Integer> activeMenuItemIds,
                                             Set<String> multiEntryPackages) {
         if (activeMenuKeys.contains(key)) return true;
+        if (itemId > 0 && itemId != 39 && activeMenuItemIds != null
+                && activeMenuItemIds.contains(Integer.valueOf(itemId))) {
+            return true;
+        }
+        if (!cls.isEmpty() && !"*".equals(cls)) {
+            String fullCls = (!pkg.isEmpty() && cls.startsWith(".")) ? pkg + cls : cls;
+            if (activeMenuKeys.contains("@class/" + cls) || activeMenuKeys.contains("@class/" + fullCls)) {
+                return true;
+            }
+        }
         if (!pkg.isEmpty()) {
+            if (("com.hkmc.radio".equals(pkg) || pkg.startsWith("com.hkmc.radio."))
+                    && activeMenuKeys.contains("@class/Radio")) {
+                return true;
+            }
             boolean isMulti = "com.android.settings".equals(pkg)
                     || (multiEntryPackages != null && multiEntryPackages.contains(pkg));
             if (!isMulti) {
-                if (activeMenuKeys.contains(pkg + "/*")) return true;
-                if ((cls.isEmpty() || "*".equals(cls)) && activeMenuPackages.contains(pkg)) return true;
+                if (activeMenuKeys.contains(pkg + "/*") || activeMenuPackages.contains(pkg)) return true;
             } else if ("com.android.settings/com.android.settings.Settings".equals(key)
                     && activeMenuKeys.contains("com.android.settings/*")) {
                 return true;
             }
+        }
+        return false;
+    }
+
+    private static boolean isUnconditionalCoreStockTile(String title, String pkg, String cls) {
+        String t = clean(title).toLowerCase(Locale.US);
+        String p = clean(pkg).toLowerCase(Locale.US);
+        String c = clean(cls).toLowerCase(Locale.US);
+        String fullCls = (!p.isEmpty() && c.startsWith(".")) ? p + c : c;
+        String probe = p + "/" + fullCls;
+        if (probe.contains("ims") || probe.contains("memoryseat") || probe.contains("seatmemory")
+                || probe.contains("seatposition") || probe.contains("soundmood") || probe.contains("moodlamp")
+                || probe.contains("dvrs") || probe.contains("builtincam") || probe.contains("vibe")
+                || probe.contains("hdradio") || t.contains("hd radio") || t.contains("sirius")) {
+            return false;
+        }
+        if ("com.android.settings".equals(p)) {
+            if ("com.android.settings.settings".equals(fullCls)) return true;
+            return (fullCls.isEmpty() || "*".equals(fullCls))
+                    && ("setup".equals(t) || "settings".equals(t));
+        }
+        if ("radio".equals(t) || p.equals("com.hkmc.radio") || p.startsWith("com.hkmc.radio.")
+                || p.equals("com.daudio.app.radio") || ("radio".equals(c) && p.isEmpty())) {
+            return true;
+        }
+        if ("media".equals(t) || p.equals("com.hkmc.media") || p.startsWith("com.hkmc.media.")
+                || p.equals("com.daudio.app.media")) {
+            return true;
+        }
+        if ("phone".equals(t) || p.equals("com.hkmc.phone") || p.startsWith("com.hkmc.phone.")
+                || p.equals("com.hkmc.btphone")) {
+            return true;
+        }
+        if ("phone projection".equals(t) || p.contains(".projection")
+                || p.equals("com.daudio.app.dipo") || p.equals("com.google.android.projection.sink")) {
+            return true;
+        }
+        if ("voice memo".equals(t) || p.contains("voicememo")) {
+            return true;
+        }
+        if ("user's manual".equals(t) || "users manual".equals(t)
+                || p.contains("qrmanual") || p.contains("webmanual") || p.contains("appmanual")) {
+            return true;
+        }
+        if ("notifications".equals(t) || p.contains("notification") || p.contains("noticecenter")) {
+            return true;
+        }
+        if (p.startsWith("com.mnsoft.")
+                && ("navigation menu".equals(t) || "navigation".equals(t) || "map".equals(t) || p.equals("com.mnsoft.navi"))) {
+            return true;
         }
         return false;
     }
@@ -887,6 +1038,7 @@ public final class TileCatalogProvider extends ContentProvider {
                         && PUBLIC_STATE.lastModified() > cfgFile.lastModified() + 1000L) {
                     JSONObject fromState = readStateSettingsJson();
                     if (fromState != null) {
+                        fromState.put("configured", true);
                         writeAtomic(cfgFile, fromState.toString());
                         return fromState.toString();
                     }
@@ -896,9 +1048,7 @@ public final class TileCatalogProvider extends ContentProvider {
         }
 
         JSONObject fromState = readStateSettingsJson();
-        if (fromState != null && (fromState.optJSONArray("hidden") != null
-                && fromState.optJSONArray("hidden").length() > 0
-                || !fromState.optBoolean("compact_gaps", true))) {
+        if (fromState != null && fromState.optBoolean("configured", false)) {
             try {
                 writeAtomic(cfgFile, fromState.toString());
             } catch (Throwable ignored) {}
@@ -934,6 +1084,10 @@ public final class TileCatalogProvider extends ContentProvider {
                 out.put("synced_hmgapi", syncedHmgApi);
                 writeAtomic(new File(ctx.getFilesDir(), CONFIG_FILE), out.toString());
             } catch (Throwable ignored) {}
+            try {
+                File legacy = new File(LEGACY_PUBLIC_CONFIG);
+                if (legacy.isFile()) legacy.delete();
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -957,8 +1111,9 @@ public final class TileCatalogProvider extends ContentProvider {
                     if (!k.isEmpty()) norm.add(k);
                 }
             }
+            boolean isConfigured = settings.optBoolean("configured", false) || !norm.isEmpty() || !compact;
             JSONObject out = new JSONObject();
-            out.put("configured", true);
+            out.put("configured", isConfigured);
             out.put("compact_gaps", compact);
             JSONArray arr = new JSONArray();
             for (String k : norm) arr.put(k);

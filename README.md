@@ -16,10 +16,13 @@ Declutter your Gen5W **All Menus / Home Screen** and **Home Screen Menu Editor**
 - **Per-Profile Non-Destructive Backup & Restore**
   - Before hiding any tile from `content://com.hkmc.system.app.homesetting.provider/all_menu`, Tile Manager records its exact `packageName`, `className`, `itemId`, and `slot` per driver profile (*Driver 1*, *Driver 2*, *Guest*).
   - Toggling a tile back **ON** (or tapping **Show All**) restores it to its original slot if empty—or the next open slot—while automatically pruning backups for any mod/app uninstalled while hidden so phantom blank tiles never appear.
-- **Automatic Empty Gap Compaction**
-  - Optional **Close Empty Gaps** toggle shifts remaining visible tiles left so hiding apps in the middle of a page never leaves awkward holes across your launcher grid.
+- **Full Stock *Edit Home Icons* Integration & One-Tap Launch**
+  - Tap **Edit Home Icons** directly from Tile Manager's header to open Gen5W's native multi-page drag-and-drop icon arranger on top of Tile Manager (press **Back** to return right to Tile Manager).
+  - Reorder tiles or place intentional multi-page spacers in stock *Edit Home Icons*—Tile Manager preserves your custom order and spacing across reloads and reboots even while other tiles remain hidden.
+- **Event-Driven Empty Gap Compaction**
+  - Optional **Close Empty Gaps** toggle packs visible tiles left whenever you hide a tile or turn compaction ON, without stripping intentional multi-page layouts saved afterward.
 - **Material Design 3 Widescreen Interface (`1920×720`)**
-  - Adaptive **Day / Night** M3 tonal surfaces (`UiModeManager`), animated stadium switches, live installed app icons with crisp vector fallbacks, **All Home Tiles / Packages & Mods / System Apps** category rail, one-tap **Show All** recovery, and safety prompts before hiding critical management apps (*HMG-API*, *NEMESIS*, *Tile Manager*, *Setup*).
+  - Adaptive **Day / Night** M3 tonal surfaces (`UiModeManager`), animated stadium switches, genuine Gen5W launcher icons (`Launcher_WP3`) alongside custom mod icons, **All Home Tiles / Packages & Mods / System Apps** navigation rail, one-tap **Show All** self-healing recovery, and safety prompts before hiding critical management apps (*HMG-API*, *NEMESIS*, *Tile Manager*, *Setup*).
   - Supports **NEMESIS Manager → Launch**, **HMG-API Star (★) Key** binding, and stock-gradient Gen5W launcher tiles.
 
 ---

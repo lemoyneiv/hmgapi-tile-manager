@@ -341,32 +341,38 @@ final class TileWidgets {
             hiddenBadge.setVisibility(vis ? View.GONE : View.VISIBLE);
         }
 
-        private static FrameLayout buildTileIconBox(Context c, TileItem item) {
+        static FrameLayout buildTileIconBox(Context c, TileItem item) {
+            return buildTileIconBox(c, item, 44);
+        }
+
+        static FrameLayout buildTileIconBox(Context c, TileItem item, int boxDp) {
             FrameLayout box = new FrameLayout(c);
             int bg = item.isPackage()
                     ? withAlpha(TERTIARY_CONT, night ? 150 : 190)
                     : (night ? 0xFF1A202B : 0xFFF2F5FA);
-            box.setBackground(shape(bg, OUTLINE_VAR, Math.max(1, dp(c, 1)), dp(c, 13)));
-            box.setLayoutParams(new LayoutParams(dp(c, 44), dp(c, 44)));
+            int cornerDp = Math.max(10, Math.round(boxDp * 0.30f));
+            box.setBackground(shape(bg, OUTLINE_VAR, Math.max(1, dp(c, 1)), dp(c, cornerDp)));
+            box.setLayoutParams(new LayoutParams(dp(c, boxDp), dp(c, boxDp)));
 
             SystemIconResolver.ResolvedIcon resolved = SystemIconResolver.resolve(c, item);
             Drawable icon = resolved.drawable;
+            float scale = boxDp / 44f;
             if (resolved.isVector) {
                 View vec = new View(c);
                 vec.setBackground(icon);
-                int vecDp = item.isPackage() ? 22 : 25;
+                int vecDp = Math.max(18, Math.round((item.isPackage() ? 22 : 25) * scale));
                 box.addView(vec, new FrameLayout.LayoutParams(dp(c, vecDp), dp(c, vecDp), Gravity.CENTER));
             } else if (icon != null) {
                 ImageView iv = new ImageView(c);
                 iv.setImageDrawable(icon);
                 iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                int imgDp = resolved.isLauncherPlate ? 38 : 32;
+                int imgDp = Math.max(24, Math.round((resolved.isLauncherPlate ? 38 : 32) * scale));
                 box.addView(iv, new FrameLayout.LayoutParams(dp(c, imgDp), dp(c, imgDp), Gravity.CENTER));
             }
             return box;
         }
 
-        private static String kindLabel(TileItem item) {
+        static String kindLabel(TileItem item) {
             if (item.orphan) return "SAVED";
             if (item.isPackage()) {
                 if ("hmgapi".equals(item.modId)) return "HMG-API";

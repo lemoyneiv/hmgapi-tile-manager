@@ -48,6 +48,9 @@ final class TileIcons extends Drawable {
     static final int SYS_PASSENGER_TALK = 28;
     static final int SYS_CAMERA = 29;
 
+    // Stock Edit Home Icons action icon
+    static final int ARRANGE = 30;
+
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path path = new Path();
     private final RectF rect = new RectF();
@@ -422,6 +425,22 @@ final class TileIcons extends Drawable {
                 c.drawLine(8.5f * s, 6.8f * s, 10.0f * s, 4.8f * s, p);
                 c.drawLine(10.0f * s, 4.8f * s, 14.0f * s, 4.8f * s, p);
                 c.drawLine(14.0f * s, 4.8f * s, 15.5f * s, 6.8f * s, p);
+                break;
+            }
+            case ARRANGE: {
+                // Opposing horizontal swap/reorder arrows
+                c.drawLine(4.0f * s, 8.2f * s, 19.5f * s, 8.2f * s, p);
+                path.moveTo(15.5f * s, 4.5f * s);
+                path.lineTo(19.8f * s, 8.2f * s);
+                path.lineTo(15.5f * s, 11.9f * s);
+                c.drawPath(path, p);
+
+                path.reset();
+                c.drawLine(20.0f * s, 15.8f * s, 4.5f * s, 15.8f * s, p);
+                path.moveTo(8.5f * s, 12.1f * s);
+                path.lineTo(4.2f * s, 15.8f * s);
+                path.lineTo(8.5f * s, 19.5f * s);
+                c.drawPath(path, p);
                 break;
             }
         }

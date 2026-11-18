@@ -26,15 +26,35 @@ import java.util.Set;
 public final class TileStore {
     private TileStore() {}
 
-    public static final int CATALOG_SCHEMA = 4;
+    public static final int CATALOG_SCHEMA = 5;
 
     public static final String ACTION_TILES_CHANGED = "dev.lemoyne.tiles.ACTION_TILES_CHANGED";
     public static final String ACTION_REQUEST_CATALOG = "dev.lemoyne.tiles.ACTION_REQUEST_CATALOG";
+    public static final String ACTION_OPEN_STOCK_EDITOR = "dev.lemoyne.tiles.ACTION_OPEN_STOCK_EDITOR";
+    public static final String EMPTY_SLOT_TOKEN = "@empty";
     public static final String PROVIDER_AUTH = "dev.lemoyne.tiles.provider";
 
     public static final String BACKUP_FILE = "hmgapi-tile-manager-backup.json";
     public static final String LEGACY_BACKUP_FILE = "hmgapi-hidden-backup.json";
     public static final String LEGACY_PUBLIC_CONFIG = "/data/hmgapi/public/launcher-tiles.json";
+
+    public static final class ProfileSlot {
+        public final int index;
+        public final boolean empty;
+        public final String key;
+        public final String packageName;
+        public final String className;
+        public final int itemId;
+
+        public ProfileSlot(int index, boolean empty, String key, String packageName, String className, int itemId) {
+            this.index = index;
+            this.empty = empty;
+            this.key = key == null ? "" : key;
+            this.packageName = packageName == null ? "" : packageName;
+            this.className = className == null ? "" : className;
+            this.itemId = itemId;
+        }
+    }
 
     public static final class Config {
         public final boolean exists;
@@ -91,6 +111,7 @@ public final class TileStore {
 
     public static final class MenuInventory {
         public final List<MenuEntryRecord> activeEntries;
+        public final List<MenuEntryRecord> allNonGuestEntries;
         public final Set<String> equippedKeys;
         public final Set<String> equippedPackages;
         public final Map<String, String> classToPackage;
@@ -101,13 +122,23 @@ public final class TileStore {
                              Set<String> equippedPackages, Map<String, String> classToPackage,
                              Map<Integer, MenuEntryRecord> byItemId) {
             this(activeEntries, equippedKeys, equippedPackages, classToPackage, byItemId,
-                    Collections.<String>emptySet());
+                    Collections.<String>emptySet(), activeEntries);
         }
 
         public MenuInventory(List<MenuEntryRecord> activeEntries, Set<String> equippedKeys,
                              Set<String> equippedPackages, Map<String, String> classToPackage,
                              Map<Integer, MenuEntryRecord> byItemId, Set<String> backedUpKeys) {
+            this(activeEntries, equippedKeys, equippedPackages, classToPackage, byItemId,
+                    backedUpKeys, activeEntries);
+        }
+
+        public MenuInventory(List<MenuEntryRecord> activeEntries, Set<String> equippedKeys,
+                             Set<String> equippedPackages, Map<String, String> classToPackage,
+                             Map<Integer, MenuEntryRecord> byItemId, Set<String> backedUpKeys,
+                             List<MenuEntryRecord> allNonGuestEntries) {
             this.activeEntries = Collections.unmodifiableList(activeEntries);
+            this.allNonGuestEntries = Collections.unmodifiableList(
+                    allNonGuestEntries == null ? activeEntries : allNonGuestEntries);
             this.equippedKeys = Collections.unmodifiableSet(equippedKeys);
             this.equippedPackages = Collections.unmodifiableSet(equippedPackages);
             this.classToPackage = Collections.unmodifiableMap(classToPackage);
@@ -137,6 +168,30 @@ public final class TileStore {
         }
     }
 
+    public static final class ReconcileTile {
+        public final String key;
+        public final String packageName;
+        public final String className;
+        public final String title;
+        public final int itemId;
+
+        public ReconcileTile(String key, String packageName, String className, String title, int itemId) {
+            String p = cleanToken(packageName);
+            String c = cleanToken(className);
+            if ("*".equals(c)) c = "";
+            this.packageName = p;
+            this.className = c;
+            this.title = title == null ? "" : title.trim();
+            this.itemId = (itemId > 0 && itemId != 39) ? itemId : 1;
+            String norm = normKeyString(key);
+            this.key = !norm.isEmpty() ? norm : normKey(p, c, this.itemId);
+        }
+    }
+
+    public interface InstallChecker {
+        boolean isBackupStillInstalled(String backupKey, String pkg, String cls, int itemId);
+    }
+
     public interface IntStringProbe {
         String resolveStringResource(int resId);
     }
@@ -154,11 +209,14 @@ public final class TileStore {
      * ArrayList wrapper installed on launcher.menu_list.items and homesetting.edit_list.items
      * before HMG-API's own afterHookedMethod runs (Bridge.handleHookedMethod executes after-hooks
      * in LIFO order). Any mod/custom tile appended later by HmgApi.launcher, HmgApi.editor, or
-     * NEMESIS is automatically recorded in rawItems and filtered from the visible list if hidden.
+     * NEMESIS is automatically recorded in rawItems and filtered from the visible list if hidden,
+     * while in-place reorders (set, remove, add-at-index, and Dalvik ArrayListIterator.set during
+     * Collections.sort) stay synchronised into rawItems without duplicating or dropping hidden items.
      */
     public static final class FilterableMenuList extends ArrayList<Object> {
         private static final long serialVersionUID = 1L;
         private final List<Object> rawItems = new ArrayList<Object>();
+        private final List<Integer> visibleRawIndices = new ArrayList<Integer>();
         private transient ItemVisibilityFilter filter;
         private transient boolean internalRefiltering;
 
@@ -179,13 +237,34 @@ public final class TileStore {
             }
             List<Object> copy = source == null ? Collections.emptyList() : new ArrayList<Object>(source);
             rawItems.clear();
-            rawItems.addAll(copy);
+            visibleRawIndices.clear();
+            for (Object e : copy) {
+                if (indexOfIdentity(rawItems, e) < 0) {
+                    rawItems.add(e);
+                }
+            }
             return rebuildVisibleLocked();
         }
 
         public synchronized int refilter(ItemVisibilityFilter nextFilter) {
+            syncVisibleOrderIntoRawLocked();
             if (nextFilter != null) this.filter = nextFilter;
             return rebuildVisibleLocked();
+        }
+
+        /**
+         * Propagates any direct super-array element replacements (such as Android 4.4 KitKat
+         * ArrayList$ArrayListIterator.set invoked by Collections.sort) back into rawItems before
+         * rebuilding or snapshotting.
+         */
+        private void syncVisibleOrderIntoRawLocked() {
+            if (visibleRawIndices.size() != super.size()) return;
+            for (int i = 0; i < visibleRawIndices.size(); i++) {
+                int rawIdx = visibleRawIndices.get(i).intValue();
+                if (rawIdx >= 0 && rawIdx < rawItems.size()) {
+                    rawItems.set(rawIdx, super.get(i));
+                }
+            }
         }
 
         private int rebuildVisibleLocked() {
@@ -193,10 +272,13 @@ public final class TileStore {
             int hiddenCount = 0;
             try {
                 super.clear();
-                for (Object item : rawItems) {
+                visibleRawIndices.clear();
+                for (int i = 0; i < rawItems.size(); i++) {
+                    Object item = rawItems.get(i);
                     if (filter != null) filter.onItemAdded(item);
                     if (filter == null || filter.shouldShow(item)) {
                         super.add(item);
+                        visibleRawIndices.add(Integer.valueOf(i));
                     } else {
                         hiddenCount++;
                     }
@@ -208,17 +290,24 @@ public final class TileStore {
         }
 
         public synchronized List<Object> snapshotRaw() {
+            syncVisibleOrderIntoRawLocked();
             return new ArrayList<Object>(rawItems);
         }
 
         @Override
         public synchronized boolean add(Object e) {
             if (internalRefiltering) return super.add(e);
+            syncVisibleOrderIntoRawLocked();
+            if (indexOfIdentity(rawItems, e) >= 0) {
+                return false;
+            }
+            int rawIdx = rawItems.size();
             rawItems.add(e);
             if (filter != null) filter.onItemAdded(e);
             if (filter != null && !filter.shouldShow(e)) {
                 return false;
             }
+            visibleRawIndices.add(Integer.valueOf(rawIdx));
             return super.add(e);
         }
 
@@ -228,13 +317,38 @@ public final class TileStore {
                 super.add(index, element);
                 return;
             }
-            rawItems.add(element);
+            syncVisibleOrderIntoRawLocked();
+            int existingRaw = indexOfIdentity(rawItems, element);
+            if (existingRaw >= 0) {
+                rawItems.remove(existingRaw);
+                int existingVis = indexOfIdentity(this, element);
+                if (existingVis >= 0) {
+                    super.remove(existingVis);
+                    if (existingVis < visibleRawIndices.size()) {
+                        visibleRawIndices.remove(existingVis);
+                    }
+                    if (index > existingVis) index--;
+                }
+                for (int i = 0; i < visibleRawIndices.size(); i++) {
+                    int cur = visibleRawIndices.get(i).intValue();
+                    if (cur > existingRaw) visibleRawIndices.set(i, Integer.valueOf(cur - 1));
+                }
+            }
+            int safeIndex = Math.max(0, Math.min(index, super.size()));
+            int rawInsertIdx = (safeIndex < visibleRawIndices.size())
+                    ? visibleRawIndices.get(safeIndex).intValue()
+                    : rawItems.size();
+            rawItems.add(rawInsertIdx, element);
+            for (int i = 0; i < visibleRawIndices.size(); i++) {
+                int cur = visibleRawIndices.get(i).intValue();
+                if (cur >= rawInsertIdx) visibleRawIndices.set(i, Integer.valueOf(cur + 1));
+            }
             if (filter != null) filter.onItemAdded(element);
             if (filter != null && !filter.shouldShow(element)) {
                 return;
             }
-            int safeIndex = Math.max(0, Math.min(index, super.size()));
             super.add(safeIndex, element);
+            visibleRawIndices.add(safeIndex, Integer.valueOf(rawInsertIdx));
         }
 
         @Override
@@ -253,24 +367,134 @@ public final class TileStore {
             if (c == null || c.isEmpty()) return false;
             if (internalRefiltering) return super.addAll(index, c);
             int cur = Math.max(0, Math.min(index, super.size()));
-            boolean modified = false;
+            int beforeSize = super.size();
             for (Object e : c) {
-                rawItems.add(e);
-                if (filter != null) filter.onItemAdded(e);
-                if (filter == null || filter.shouldShow(e)) {
-                    super.add(cur++, e);
-                    modified = true;
+                int prev = super.size();
+                add(cur, e);
+                if (super.size() > prev) cur++;
+            }
+            return super.size() != beforeSize;
+        }
+
+        @Override
+        public synchronized Object set(int index, Object element) {
+            if (internalRefiltering) return super.set(index, element);
+            syncVisibleOrderIntoRawLocked();
+            Object prev = super.get(index);
+            int rawIdx = (index >= 0 && index < visibleRawIndices.size())
+                    ? visibleRawIndices.get(index).intValue()
+                    : indexOfIdentityOrEquals(rawItems, prev);
+            if (filter != null) filter.onItemAdded(element);
+            boolean show = (filter == null || filter.shouldShow(element));
+            if (rawIdx >= 0 && rawIdx < rawItems.size()) {
+                rawItems.set(rawIdx, element);
+            } else {
+                rawItems.add(element);
+                rawIdx = rawItems.size() - 1;
+            }
+            if (show) {
+                return super.set(index, element);
+            }
+            Object removed = super.remove(index);
+            if (index >= 0 && index < visibleRawIndices.size()) {
+                visibleRawIndices.remove(index);
+            }
+            return removed;
+        }
+
+        @Override
+        public synchronized Object remove(int index) {
+            if (internalRefiltering) return super.remove(index);
+            syncVisibleOrderIntoRawLocked();
+            Object removed = super.remove(index);
+            int rawIdx = (index >= 0 && index < visibleRawIndices.size())
+                    ? visibleRawIndices.remove(index).intValue()
+                    : indexOfIdentityOrEquals(rawItems, removed);
+            if (rawIdx >= 0 && rawIdx < rawItems.size()) {
+                rawItems.remove(rawIdx);
+                for (int i = 0; i < visibleRawIndices.size(); i++) {
+                    int cur = visibleRawIndices.get(i).intValue();
+                    if (cur > rawIdx) visibleRawIndices.set(i, Integer.valueOf(cur - 1));
                 }
             }
-            return modified;
+            return removed;
+        }
+
+        @Override
+        public synchronized boolean remove(Object o) {
+            if (internalRefiltering) return super.remove(o);
+            syncVisibleOrderIntoRawLocked();
+            int visIdx = indexOfIdentityOrEquals(this, o);
+            if (visIdx >= 0) {
+                remove(visIdx);
+                return true;
+            }
+            int rawIdx = indexOfIdentityOrEquals(rawItems, o);
+            if (rawIdx >= 0) {
+                rawItems.remove(rawIdx);
+                for (int i = 0; i < visibleRawIndices.size(); i++) {
+                    int cur = visibleRawIndices.get(i).intValue();
+                    if (cur > rawIdx) visibleRawIndices.set(i, Integer.valueOf(cur - 1));
+                }
+                return true;
+            }
+            return false;
         }
 
         @Override
         public synchronized void clear() {
             if (!internalRefiltering) {
                 rawItems.clear();
+                visibleRawIndices.clear();
             }
             super.clear();
+        }
+
+        @Override
+        public synchronized boolean removeAll(Collection<?> c) {
+            if (c == null || c.isEmpty()) return false;
+            if (internalRefiltering) return super.removeAll(c);
+            syncVisibleOrderIntoRawLocked();
+            boolean changed = false;
+            for (Object o : c) {
+                while (remove(o)) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        @Override
+        public synchronized boolean retainAll(Collection<?> c) {
+            if (c == null) return false;
+            if (internalRefiltering) return super.retainAll(c);
+            syncVisibleOrderIntoRawLocked();
+            boolean changed = false;
+            for (int i = super.size() - 1; i >= 0; i--) {
+                if (!c.contains(super.get(i))) {
+                    remove(i);
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        private static int indexOfIdentity(List<?> list, Object target) {
+            if (list == null) return -1;
+            for (int i = 0; i < list.size(); i++) {
+                if (list.get(i) == target) return i;
+            }
+            return -1;
+        }
+
+        private static int indexOfIdentityOrEquals(List<?> list, Object target) {
+            int idx = indexOfIdentity(list, target);
+            if (idx >= 0 || list == null) return idx;
+            for (int i = 0; i < list.size(); i++) {
+                Object cur = list.get(i);
+                if (target == null ? cur == null : target.equals(cur)) return i;
+            }
+            return -1;
         }
     }
 
@@ -1023,8 +1247,9 @@ public final class TileStore {
 
     /**
      * Selects active driver profile ALL_MENU JSONs while avoiding unpruned factory Guest/Driver 2
-     * rows: prefers custom-renamed owner profiles (e.g. Bluelink/Kia Connect profile names), then
-     * Driver 1, then non-Guest profiles, then all profiles.
+     * rows: unions custom-renamed owner profiles (e.g. Bluelink/Kia Connect profile names) with
+     * Driver 1 so neither driver shadows the other, falling back to non-Guest profiles if Driver 1
+     * has no non-empty tiles, then all profiles.
      */
     public static List<String> selectProfileMenuJsons(Map<String, String> menusByUser) {
         if (menusByUser == null || menusByUser.isEmpty()) return Collections.emptyList();
@@ -1039,23 +1264,80 @@ public final class TileStore {
             all.add(json);
             if ("Guest".equalsIgnoreCase(user)) continue;
             nonGuest.add(json);
-            if ("Driver 1".equalsIgnoreCase(user) || "User 1".equalsIgnoreCase(user) || "User1".equalsIgnoreCase(user)) {
+            if (isDriver1ProfileName(user)) {
                 driver1.add(json);
-            } else if (!user.isEmpty() && !user.startsWith("#")
-                    && !"Driver 2".equalsIgnoreCase(user) && !"User 2".equalsIgnoreCase(user) && !"User2".equalsIgnoreCase(user)
-                    && !"Driver 3".equalsIgnoreCase(user) && !"User 3".equalsIgnoreCase(user) && !"User3".equalsIgnoreCase(user)) {
+            } else if (!user.isEmpty() && !user.startsWith("#") && !isSecondaryDefaultProfileName(user)) {
                 customNamed.add(json);
             }
         }
-        if (!customNamed.isEmpty()) return customNamed;
-        if (!driver1.isEmpty()) return driver1;
+        List<String> ownerProfiles = new ArrayList<String>(customNamed.size() + driver1.size());
+        ownerProfiles.addAll(customNamed);
+        ownerProfiles.addAll(driver1);
+        if (!ownerProfiles.isEmpty() && hasAnyPlacedMenuTile(ownerProfiles)) {
+            return ownerProfiles;
+        }
         if (!nonGuest.isEmpty()) return nonGuest;
         return all;
     }
 
+    public static List<String> collectNonGuestMenuJsons(Map<String, String> menusByUser) {
+        if (menusByUser == null || menusByUser.isEmpty()) return Collections.emptyList();
+        List<String> nonGuest = new ArrayList<String>();
+        List<String> all = new ArrayList<String>();
+        for (Map.Entry<String, String> e : menusByUser.entrySet()) {
+            String user = cleanToken(e.getKey());
+            String json = e.getValue();
+            if (json == null || json.trim().isEmpty()) continue;
+            all.add(json);
+            if (!"Guest".equalsIgnoreCase(user)) nonGuest.add(json);
+        }
+        return !nonGuest.isEmpty() ? nonGuest : all;
+    }
+
+    private static boolean isDriver1ProfileName(String user) {
+        return "Driver 1".equalsIgnoreCase(user) || "Driver1".equalsIgnoreCase(user)
+                || "User 1".equalsIgnoreCase(user) || "User1".equalsIgnoreCase(user);
+    }
+
+    private static boolean isSecondaryDefaultProfileName(String user) {
+        return "Driver 2".equalsIgnoreCase(user) || "Driver2".equalsIgnoreCase(user)
+                || "User 2".equalsIgnoreCase(user) || "User2".equalsIgnoreCase(user)
+                || "Driver 3".equalsIgnoreCase(user) || "Driver3".equalsIgnoreCase(user)
+                || "User 3".equalsIgnoreCase(user) || "User3".equalsIgnoreCase(user);
+    }
+
     @SuppressWarnings("unchecked")
+    private static boolean hasAnyPlacedMenuTile(List<String> menuJsons) {
+        if (menuJsons == null) return false;
+        for (String menuJson : menuJsons) {
+            if (menuJson == null || menuJson.trim().isEmpty()) continue;
+            try {
+                Map<String, Object> root = parseObject(menuJson);
+                Object rawArr = root.get("menuItems");
+                if (!(rawArr instanceof List)) continue;
+                for (Object o : (List<Object>) rawArr) {
+                    if (!(o instanceof Map)) continue;
+                    Map<String, Object> it = (Map<String, Object>) o;
+                    if (!isEmptySlot(cleanToken(it.get("packageName")),
+                            cleanToken(it.get("className")), intVal(it.get("itemId"), -1))) {
+                        return true;
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
     public static MenuInventory collectMenuInventory(List<String> profileMenuJsons, Map<String, Object> allBackups) {
+        return collectMenuInventory(profileMenuJsons, profileMenuJsons, allBackups);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static MenuInventory collectMenuInventory(List<String> profileMenuJsons,
+                                                     List<String> allNonGuestMenuJsons,
+                                                     Map<String, Object> allBackups) {
         Map<String, MenuEntryRecord> byKey = new LinkedHashMap<String, MenuEntryRecord>();
+        Map<String, MenuEntryRecord> nonGuestByKey = new LinkedHashMap<String, MenuEntryRecord>();
         Set<String> equippedKeys = new LinkedHashSet<String>();
         Set<String> equippedPackages = new LinkedHashSet<String>();
         Map<String, String> classToPackage = new LinkedHashMap<String, String>();
@@ -1073,6 +1355,30 @@ public final class TileStore {
                         if (!(o instanceof Map)) continue;
                         recordInventoryItem((Map<String, Object>) o, byKey, equippedKeys,
                                 equippedPackages, classToPackage, byItemId);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        nonGuestByKey.putAll(byKey);
+        if (allNonGuestMenuJsons != null) {
+            for (String menuJson : allNonGuestMenuJsons) {
+                if (menuJson == null || menuJson.trim().isEmpty()) continue;
+                try {
+                    Map<String, Object> root = parseObject(menuJson);
+                    Object rawArr = root.get("menuItems");
+                    if (!(rawArr instanceof List)) continue;
+                    for (Object o : (List<Object>) rawArr) {
+                        if (!(o instanceof Map)) continue;
+                        Map<String, Object> it = (Map<String, Object>) o;
+                        String pkg = cleanToken(it.get("packageName"));
+                        String cls = cleanToken(it.get("className"));
+                        int id = intVal(it.get("itemId"), -1);
+                        if (isEmptySlot(pkg, cls, id)) continue;
+                        String key = normKey(pkg, cls, id);
+                        if (!key.isEmpty() && !nonGuestByKey.containsKey(key)) {
+                            nonGuestByKey.put(key, new MenuEntryRecord(key, pkg, cls, id));
+                        }
                     }
                 } catch (Throwable ignored) {}
             }
@@ -1101,9 +1407,15 @@ public final class TileStore {
                 }
             }
         }
+        for (Map.Entry<String, MenuEntryRecord> e : byKey.entrySet()) {
+            if (!nonGuestByKey.containsKey(e.getKey())) {
+                nonGuestByKey.put(e.getKey(), e.getValue());
+            }
+        }
 
         return new MenuInventory(new ArrayList<MenuEntryRecord>(byKey.values()),
-                equippedKeys, equippedPackages, classToPackage, byItemId, backedUpKeys);
+                equippedKeys, equippedPackages, classToPackage, byItemId, backedUpKeys,
+                new ArrayList<MenuEntryRecord>(nonGuestByKey.values()));
     }
 
     private static void recordInventoryItem(Map<String, Object> it,
@@ -1315,24 +1627,104 @@ public final class TileStore {
     }
 
     /**
+     * Identifies universal core Gen5W head-unit apps that are present on every vehicle whenever
+     * their APK & Activity are installed and enabled in PackageManager and loaded by Launcher_WP3.
+     * Allowing these unconditionally guarantees they remain visible and recoverable in Tile Manager
+     * even if an earlier version or interrupted sync left their all_menu slots empty without a
+     * backup. Never matches optional trim, powertrain (EV/HEV/PHEV), or regional features.
+     */
+    public static boolean isUnconditionalCoreStockTile(String title, String pkg, String cls) {
+        String t = cleanToken(title).toLowerCase(Locale.US);
+        String p = cleanToken(pkg).toLowerCase(Locale.US);
+        String c = cleanToken(cls).toLowerCase(Locale.US);
+        String fullCls = expandClass(p, c);
+        String probe = p + "/" + fullCls;
+
+        if (probe.contains("ims") || probe.contains("memoryseat") || probe.contains("seatmemory")
+                || probe.contains("seatposition") || probe.contains("soundmood") || probe.contains("moodlamp")
+                || probe.contains("dvrs") || probe.contains("builtincam") || probe.contains("vibe")
+                || probe.contains("hdradio") || t.contains("hd radio") || t.contains("sirius")) {
+            return false;
+        }
+
+        // 1. Main Setup / Settings activity ONLY (never optional com.android.settings sub-screens)
+        if ("com.android.settings".equals(p)) {
+            if ("com.android.settings.settings".equals(fullCls)) return true;
+            return (fullCls.isEmpty() || "*".equals(fullCls))
+                    && ("setup".equals(t) || "settings".equals(t));
+        }
+
+        // 2. Radio, Media, Phone, Phone Projection, Voice Memo, User's Manual, Notifications, Nav
+        if ("radio".equals(t) || p.equals("com.hkmc.radio") || p.startsWith("com.hkmc.radio.")
+                || p.equals("com.daudio.app.radio") || ("radio".equals(c) && p.isEmpty())) {
+            return true;
+        }
+        if ("media".equals(t) || p.equals("com.hkmc.media") || p.startsWith("com.hkmc.media.")
+                || p.equals("com.daudio.app.media")) {
+            return true;
+        }
+        if ("phone".equals(t) || p.equals("com.hkmc.phone") || p.startsWith("com.hkmc.phone.")
+                || p.equals("com.hkmc.btphone")) {
+            return true;
+        }
+        if ("phone projection".equals(t) || p.contains(".projection")
+                || p.equals("com.daudio.app.dipo") || p.equals("com.google.android.projection.sink")) {
+            return true;
+        }
+        if ("voice memo".equals(t) || p.contains("voicememo")) {
+            return true;
+        }
+        if ("user's manual".equals(t) || "users manual".equals(t)
+                || p.contains("qrmanual") || p.contains("webmanual") || p.contains("appmanual")) {
+            return true;
+        }
+        if ("notifications".equals(t) || p.contains("notification") || p.contains("noticecenter")) {
+            return true;
+        }
+        if (p.startsWith("com.mnsoft.")
+                && ("navigation menu".equals(t) || "navigation".equals(t) || "map".equals(t) || p.equals("com.mnsoft.navi"))) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * Filters unequipped trim/region ghost stock entries (e.g. Built-in Cam, Memory Seat
-     * Configuration, Sound Mood Lamp, VIBE) against the vehicle's active all_menu + Tile Manager
-     * slot backups. Note: cfg.hidden is intentionally NOT exempted here so stale ghost keys from
-     * older versions cannot keep unequipped entries alive; real hidden tiles are preserved via
-     * hmgapi-tile-manager-backup.json inside MenuInventory.equippedKeys.
+     * Configuration, Sound Mood Lamp, VIBE, or unequipped powertrain tiles) against the vehicle's
+     * active all_menu + Tile Manager slot backups across exact keys, single-tile package aliases,
+     * @class/* virtual entries, and itemId correlation.
      */
     public static boolean isEquippedSystemTile(String key, String pkg, String cls,
                                                MenuInventory inv, Set<String> multiEntryPackages) {
+        return isEquippedSystemTile(key, pkg, cls, -1, inv, multiEntryPackages);
+    }
+
+    public static boolean isEquippedSystemTile(String key, String pkg, String cls, int itemId,
+                                               MenuInventory inv, Set<String> multiEntryPackages) {
         if (inv == null || !inv.hasAnyData()) return true;
         if (inv.equippedKeys.contains(key)) return true;
+        if (itemId > 0 && itemId != 39 && inv.byItemId.containsKey(Integer.valueOf(itemId))) {
+            return true;
+        }
         String p = cleanToken(pkg);
         String c = cleanToken(cls);
+        if (!c.isEmpty() && !"*".equals(c)) {
+            String fullCls = expandClass(p, c);
+            if (inv.equippedKeys.contains("@class/" + c) || inv.equippedKeys.contains("@class/" + fullCls)) {
+                return true;
+            }
+        }
         if (!p.isEmpty()) {
+            if (("com.hkmc.radio".equals(p) || p.startsWith("com.hkmc.radio."))
+                    && inv.equippedKeys.contains("@class/Radio")) {
+                return true;
+            }
             boolean isMulti = "com.android.settings".equals(p)
                     || (multiEntryPackages != null && multiEntryPackages.contains(p));
             if (!isMulti) {
-                if (inv.equippedKeys.contains(p + "/*")) return true;
-                if ((c.isEmpty() || "*".equals(c)) && inv.equippedPackages.contains(p)) return true;
+                if (inv.equippedKeys.contains(p + "/*") || inv.equippedPackages.contains(p)) {
+                    return true;
+                }
             } else if ("com.android.settings/com.android.settings.Settings".equals(key)
                     && inv.equippedKeys.contains("com.android.settings/*")) {
                 return true;
@@ -1388,14 +1780,64 @@ public final class TileStore {
         }
     }
 
+    private static InstallChecker checkerFromKeySet(final Set<String> installedKeys) {
+        if (installedKeys == null) return null;
+        return new InstallChecker() {
+            @Override
+            public boolean isBackupStillInstalled(String backupKey, String pkg, String cls, int itemId) {
+                String exact = normKey(pkg, cls, itemId);
+                if (installedKeys.contains(backupKey) || (!exact.isEmpty() && installedKeys.contains(exact))) {
+                    return true;
+                }
+                String p = cleanToken(pkg);
+                String c = cleanToken(cls);
+                if (!p.isEmpty()) {
+                    if (installedKeys.contains(p + "/*")) return true;
+                    if (!"com.android.settings".equals(p)) {
+                        String prefix = p + "/";
+                        for (String ik : installedKeys) {
+                            if (ik.startsWith(prefix)) return true;
+                        }
+                    }
+                } else if (!c.isEmpty()) {
+                    // Virtual @class/Radio backup matches com.hkmc.radio/com.hkmc.radio.RadioActivity
+                    String lowC = c.toLowerCase(Locale.US);
+                    for (String ik : installedKeys) {
+                        String lowIk = ik.toLowerCase(Locale.US);
+                        if (lowIk.endsWith("/" + lowC) || lowIk.endsWith("." + lowC)
+                                || ("radio".equals(lowC) && lowIk.startsWith("com.hkmc.radio/"))) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        };
+    }
+
     /**
      * Synchronises one profile's all_menu JSON against hidden-tile settings, backing up
      * hidden stock and mod tiles with their exact itemId/slot and restoring them when
      * unhidden (provided their activity is still installed when installedKeys != null).
      */
-    @SuppressWarnings("unchecked")
     public static SyncResult syncProfileMenu(String user, String menuJson, Config cfg,
             Set<String> installedKeys, Map<String, Object> allBackups) {
+        return syncProfileMenu(user, menuJson, cfg, checkerFromKeySet(installedKeys),
+                allBackups, null, null, false);
+    }
+
+    public static SyncResult syncProfileMenu(String user, String menuJson, Config cfg,
+            InstallChecker installChecker, Map<String, Object> allBackups,
+            List<ReconcileTile> reconcileTiles, Set<String> multiEntryPackages) {
+        return syncProfileMenu(user, menuJson, cfg, installChecker,
+                allBackups, reconcileTiles, multiEntryPackages, false);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static SyncResult syncProfileMenu(String user, String menuJson, Config cfg,
+            InstallChecker installChecker, Map<String, Object> allBackups,
+            List<ReconcileTile> reconcileTiles, Set<String> multiEntryPackages,
+            boolean forceCompact) {
         List<String> logs = new ArrayList<String>();
         Map<String, Object> root = parseObject(menuJson);
         Object rawArr = root.get("menuItems");
@@ -1407,11 +1849,12 @@ public final class TileStore {
 
         boolean changed = false;
         boolean backupChanged = false;
+        boolean newlyHidAny = false;
 
         // 1. Back up and clear any currently-placed tile that is marked hidden.
         //    If a backup already exists for this tile (e.g. HmgApi.syncSavedMenu temporarily
         //    re-inserted a hidden mod tile into a different empty slot on boot), preserve the
-        //    user's original backed-up slot!
+        //    user's original backed-up slot and do not treat it as a fresh hide event!
         for (int k = 0; k < arr.size(); k++) {
             if (!(arr.get(k) instanceof Map)) continue;
             Map<String, Object> it = (Map<String, Object>) arr.get(k);
@@ -1438,6 +1881,7 @@ public final class TileStore {
                 bak.put("slot", Long.valueOf(k));
                 userBackup.put(matchedKey, bak);
                 backupChanged = true;
+                newlyHidAny = true;
             }
 
             arr.set(k, emptySlotMap());
@@ -1447,7 +1891,10 @@ public final class TileStore {
 
         // 2. Collect all non-empty keys currently placed on the grid
         Set<String> presentKeys = new LinkedHashSet<String>();
+        Set<String> presentPackages = new LinkedHashSet<String>();
         Set<String> presentClasses = new LinkedHashSet<String>();
+        Set<String> presentExpandedClasses = new LinkedHashSet<String>();
+        Set<String> presentLowerTitles = new LinkedHashSet<String>();
         Set<Integer> presentItemIds = new LinkedHashSet<Integer>();
         for (int k = 0; k < arr.size(); k++) {
             if (!(arr.get(k) instanceof Map)) continue;
@@ -1457,11 +1904,16 @@ public final class TileStore {
             int id = intVal(it.get("itemId"), -1);
             if (isEmptySlot(pkg, cls, id)) continue;
             presentKeys.add(normKey(pkg, cls, id));
-            if (!cls.isEmpty()) presentClasses.add(cls);
+            if (!pkg.isEmpty()) presentPackages.add(pkg);
+            if (!cls.isEmpty()) {
+                presentClasses.add(cls);
+                presentExpandedClasses.add(expandClass(pkg, cls));
+                if (pkg.isEmpty()) presentLowerTitles.add(cls.trim().toLowerCase(Locale.US));
+            }
             if (id > 0 && id != 39) presentItemIds.add(Integer.valueOf(id));
         }
 
-        // 3. Restore unhidden tiles from backup (pruning any whose package was uninstalled)
+        // 3. Restore unhidden tiles from backup (pruning only those whose package was actually uninstalled)
         for (String key : new ArrayList<String>(userBackup.keySet())) {
             Object rawBak = userBackup.get(key);
             if (!(rawBak instanceof Map)) {
@@ -1477,15 +1929,16 @@ public final class TileStore {
                 continue;
             }
             String exactBakKey = normKey(bPkg, bCls, bId);
-            if (installedKeys != null && !installedKeys.contains(key) && !installedKeys.contains(exactBakKey)
-                    && (bPkg.isEmpty() || !installedKeys.contains(bPkg + "/*"))) {
+            if (installChecker != null && !installChecker.isBackupStillInstalled(key, bPkg, bCls, bId)) {
                 userBackup.remove(key);
                 backupChanged = true;
                 logs.add("saved menu (" + user + "): dropped backup for uninstalled " + key);
                 continue;
             }
+            String bExpanded = expandClass(bPkg, bCls);
             if (presentKeys.contains(key) || (!exactBakKey.isEmpty() && presentKeys.contains(exactBakKey))
-                    || (!bCls.isEmpty() && !"Empty view".equals(bCls) && presentClasses.contains(bCls))
+                    || (!bCls.isEmpty() && !"Empty view".equals(bCls)
+                        && (presentClasses.contains(bCls) || presentExpandedClasses.contains(bExpanded)))
                     || (bPkg.isEmpty() && bCls.isEmpty() && bId > 0 && presentItemIds.contains(Integer.valueOf(bId)))) {
                 userBackup.remove(key);
                 backupChanged = true;
@@ -1505,7 +1958,12 @@ public final class TileStore {
             arr.set(target, restored);
             if (!exactBakKey.isEmpty()) presentKeys.add(exactBakKey);
             presentKeys.add(key);
-            if (!bCls.isEmpty()) presentClasses.add(bCls);
+            if (!bPkg.isEmpty()) presentPackages.add(bPkg);
+            if (!bCls.isEmpty()) {
+                presentClasses.add(bCls);
+                presentExpandedClasses.add(bExpanded);
+                if (bPkg.isEmpty()) presentLowerTitles.add(bCls.trim().toLowerCase(Locale.US));
+            }
             if (bId > 0) presentItemIds.add(Integer.valueOf(bId));
             userBackup.remove(key);
             backupChanged = true;
@@ -1513,8 +1971,51 @@ public final class TileStore {
             logs.add("saved menu (" + user + "): restored " + key + " in slot " + (target + 1));
         }
 
-        // 4. Close empty gaps between remaining tiles when configured
-        if (cfg.exists && cfg.compactGaps) {
+        // 3b. When requested by Show All or explicit tile unhide, re-seat any verified catalog tiles
+        //     that were orphaned from both all_menu and backup.json into available Empty view slots.
+        if (reconcileTiles != null && !reconcileTiles.isEmpty()) {
+            for (ReconcileTile rt : reconcileTiles) {
+                if (rt == null || rt.packageName.isEmpty()) continue;
+                if (cfg.hidden.contains(rt.key)
+                        || matchingHiddenKey(cfg.hidden, rt.packageName, rt.className, rt.itemId) != null) {
+                    continue;
+                }
+                if (installChecker != null
+                        && !installChecker.isBackupStillInstalled(rt.key, rt.packageName, rt.className, rt.itemId)) {
+                    continue;
+                }
+                if (isTileAlreadyPlaced(rt, presentKeys, presentPackages, presentClasses,
+                        presentExpandedClasses, presentLowerTitles, presentItemIds, multiEntryPackages)) {
+                    continue;
+                }
+                int target = firstEmptySlot(arr);
+                if (target < 0) {
+                    logs.add("saved menu (" + user + "): no empty slot to re-seat " + rt.key);
+                    continue;
+                }
+                Map<String, Object> seated = new LinkedHashMap<String, Object>();
+                seated.put("packageName", rt.packageName);
+                seated.put("itemId", Long.valueOf(rt.itemId));
+                seated.put("className", rt.className);
+                arr.set(target, seated);
+                presentKeys.add(rt.key);
+                presentKeys.add(normKey(rt.packageName, rt.className, rt.itemId));
+                presentPackages.add(rt.packageName);
+                if (!rt.className.isEmpty()) {
+                    presentClasses.add(rt.className);
+                    presentExpandedClasses.add(expandClass(rt.packageName, rt.className));
+                }
+                if (rt.itemId > 0) presentItemIds.add(Integer.valueOf(rt.itemId));
+                changed = true;
+                logs.add("saved menu (" + user + "): re-seated missing " + rt.key + " in slot " + (target + 1));
+            }
+        }
+
+        // 4. Event-driven gap compaction: close empty gaps only when a tile was newly hidden
+        //    or when compaction was explicitly requested (e.g. toggling Close Empty Gaps ON),
+        //    so passive Launcher_WP3 reloads never strip multi-page spacing saved in stock
+        //    Edit Home Icons or Tile Manager's Arrange Order UI.
+        if (cfg.exists && cfg.compactGaps && (newlyHidAny || forceCompact)) {
             List<Object> nonEmpty = new ArrayList<Object>();
             for (int k = 0; k < arr.size(); k++) {
                 if (!slotEmpty(arr.get(k))) nonEmpty.add(arr.get(k));
@@ -1542,6 +2043,229 @@ public final class TileStore {
         }
 
         return new SyncResult(changed ? writeCompact(root) : null, backupChanged, logs);
+    }
+
+    public static boolean isPrimaryOwnerProfileName(String user) {
+        String u = cleanToken(user);
+        if (u.isEmpty() || u.startsWith("#") || "Guest".equalsIgnoreCase(u)) return false;
+        return !isSecondaryDefaultProfileName(u);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static List<ProfileSlot> parseProfileSlots(String menuJson) {
+        List<ProfileSlot> out = new ArrayList<ProfileSlot>();
+        if (menuJson == null || menuJson.trim().isEmpty()) return out;
+        try {
+            Map<String, Object> root = parseObject(menuJson);
+            Object rawArr = root.get("menuItems");
+            if (!(rawArr instanceof List)) return out;
+            List<Object> arr = (List<Object>) rawArr;
+            for (int i = 0; i < arr.size(); i++) {
+                Object o = arr.get(i);
+                if (!(o instanceof Map)) {
+                    out.add(new ProfileSlot(i, true, EMPTY_SLOT_TOKEN, "Empty view", "Empty view", 39));
+                    continue;
+                }
+                Map<String, Object> it = (Map<String, Object>) o;
+                String pkg = cleanToken(it.get("packageName"));
+                String cls = cleanToken(it.get("className"));
+                int id = intVal(it.get("itemId"), -1);
+                if (isEmptySlot(pkg, cls, id)) {
+                    out.add(new ProfileSlot(i, true, EMPTY_SLOT_TOKEN, "Empty view", "Empty view", 39));
+                } else {
+                    out.add(new ProfileSlot(i, false, normKey(pkg, cls, id), pkg, cls, id));
+                }
+            }
+        } catch (Throwable ignored) {}
+        return out;
+    }
+
+    /**
+     * Losslessly reorders a driver profile's all_menu JSON according to desiredSlotTokens,
+     * preserving exact Map entries (packageName, itemId, className, including @class/*, @item/*,
+     * and 9000+ HMG-API mod IDs), retaining any unmentioned placed tiles so zero tiles can ever
+     * be lost, respecting "@empty" spacers when !compactGaps within grid capacity, and padding
+     * trailing cells to the profile's exact menuItems slot count with "Empty view".
+     */
+    @SuppressWarnings("unchecked")
+    public static SyncResult reorderProfileMenu(String user, String menuJson,
+                                                List<String> desiredSlotTokens, boolean compactGaps) {
+        List<String> logs = new ArrayList<String>();
+        if (menuJson == null || menuJson.trim().isEmpty() || desiredSlotTokens == null) {
+            return new SyncResult(null, false, logs);
+        }
+        Map<String, Object> root = parseObject(menuJson);
+        Object rawArr = root.get("menuItems");
+        if (!(rawArr instanceof List)) return new SyncResult(null, false, logs);
+        List<Object> arr = (List<Object>) rawArr;
+        if (arr.isEmpty()) return new SyncResult(null, false, logs);
+
+        List<Map<String, Object>> remainingPlaced = new ArrayList<Map<String, Object>>();
+        Map<String, Integer> pkgCounts = new LinkedHashMap<String, Integer>();
+        for (int i = 0; i < arr.size(); i++) {
+            if (!(arr.get(i) instanceof Map)) continue;
+            Map<String, Object> it = (Map<String, Object>) arr.get(i);
+            String pkg = cleanToken(it.get("packageName"));
+            String cls = cleanToken(it.get("className"));
+            int id = intVal(it.get("itemId"), -1);
+            if (isEmptySlot(pkg, cls, id)) continue;
+            remainingPlaced.add(new LinkedHashMap<String, Object>(it));
+            if (!pkg.isEmpty()) {
+                Integer prev = pkgCounts.get(pkg);
+                pkgCounts.put(pkg, Integer.valueOf(prev == null ? 1 : prev.intValue() + 1));
+            }
+        }
+
+        Set<String> multiPkgs = new LinkedHashSet<String>();
+        multiPkgs.add("com.android.settings");
+        for (Map.Entry<String, Integer> pe : pkgCounts.entrySet()) {
+            if (pe.getValue().intValue() > 1) multiPkgs.add(pe.getKey());
+        }
+
+        int totalSlots = Math.max(arr.size(), remainingPlaced.size());
+        int placedCount = remainingPlaced.size();
+        List<Object> newArr = new ArrayList<Object>(totalSlots);
+
+        for (int i = 0; i < desiredSlotTokens.size(); i++) {
+            String rawTok = desiredSlotTokens.get(i);
+            if (rawTok == null) continue;
+            String trimmed = rawTok.trim();
+            if (EMPTY_SLOT_TOKEN.equalsIgnoreCase(trimmed)) {
+                if (!compactGaps && newArr.size() + remainingPlaced.size() < totalSlots) {
+                    newArr.add(emptySlotMap());
+                }
+                continue;
+            }
+            String desiredKey = normKeyString(trimmed);
+            if (desiredKey.isEmpty()) continue;
+            int matchIdx = findMatchingPlacedIndex(remainingPlaced, desiredKey, multiPkgs);
+            if (matchIdx >= 0) {
+                newArr.add(remainingPlaced.remove(matchIdx));
+            }
+        }
+
+        for (int i = 0; i < remainingPlaced.size(); i++) {
+            newArr.add(remainingPlaced.get(i));
+        }
+        while (newArr.size() < totalSlots) {
+            newArr.add(emptySlotMap());
+        }
+
+        if (slotsIdentical(arr, newArr)) {
+            return new SyncResult(null, false, logs);
+        }
+
+        arr.clear();
+        arr.addAll(newArr);
+        logs.add("saved menu (" + user + "): applied custom tile order (" + placedCount + " tiles)");
+        return new SyncResult(writeCompact(root), false, logs);
+    }
+
+    private static int findMatchingPlacedIndex(List<Map<String, Object>> candidates,
+                                               String desiredKey, Set<String> multiPkgs) {
+        // Pass 1: exact normKey match
+        for (int i = 0; i < candidates.size(); i++) {
+            Map<String, Object> it = candidates.get(i);
+            String exact = normKey(str(it.get("packageName")), str(it.get("className")),
+                    intVal(it.get("itemId"), -1));
+            if (desiredKey.equals(exact)) return i;
+        }
+        // Pass 2: cross-representation match (@class/Radio, @item/N, or single-entry pkg/*)
+        int slash = desiredKey.indexOf('/');
+        String dLeft = slash > 0 ? desiredKey.substring(0, slash) : "";
+        String dRight = slash > 0 && slash + 1 < desiredKey.length() ? desiredKey.substring(slash + 1) : "";
+        for (int i = 0; i < candidates.size(); i++) {
+            Map<String, Object> it = candidates.get(i);
+            String pkg = cleanToken(it.get("packageName"));
+            String cls = cleanToken(it.get("className"));
+            int id = intVal(it.get("itemId"), -1);
+            if ("@item".equals(dLeft)) {
+                int wantId = intVal(dRight, -1);
+                if (wantId > 0 && id == wantId) return i;
+                continue;
+            }
+            if ("@class".equals(dLeft)) {
+                if (!cls.isEmpty() && (dRight.equalsIgnoreCase(cls)
+                        || dRight.equalsIgnoreCase(expandClass(pkg, cls)))) {
+                    return i;
+                }
+                if ("Radio".equalsIgnoreCase(dRight)
+                        && ("com.hkmc.radio".equals(pkg) || pkg.startsWith("com.hkmc.radio."))) {
+                    return i;
+                }
+                continue;
+            }
+            if (pkg.isEmpty() && !cls.isEmpty()) {
+                if ("Radio".equalsIgnoreCase(cls)
+                        && ("com.hkmc.radio".equals(dLeft) || dLeft.startsWith("com.hkmc.radio."))) {
+                    return i;
+                }
+                String lowCls = cls.toLowerCase(Locale.US);
+                String lowRight = dRight.toLowerCase(Locale.US);
+                if (lowRight.equals(lowCls) || lowRight.endsWith("." + lowCls)) {
+                    return i;
+                }
+                continue;
+            }
+            if (!pkg.isEmpty() && pkg.equals(dLeft)) {
+                if (!multiPkgs.contains(pkg)) return i;
+                if ("com.android.settings/com.android.settings.Settings".equals(desiredKey)
+                        && (cls.isEmpty() || "*".equals(cls))) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static boolean slotsIdentical(List<Object> a, List<Object> b) {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            boolean aEmpty = slotEmpty(a.get(i));
+            boolean bEmpty = slotEmpty(b.get(i));
+            if (aEmpty != bEmpty) return false;
+            if (aEmpty) continue;
+            Map<String, Object> ma = (Map<String, Object>) a.get(i);
+            Map<String, Object> mb = (Map<String, Object>) b.get(i);
+            if (!cleanToken(ma.get("packageName")).equals(cleanToken(mb.get("packageName")))) return false;
+            if (!cleanToken(ma.get("className")).equals(cleanToken(mb.get("className")))) return false;
+            if (intVal(ma.get("itemId"), -1) != intVal(mb.get("itemId"), -1)) return false;
+        }
+        return true;
+    }
+
+    private static boolean isTileAlreadyPlaced(ReconcileTile rt, Set<String> presentKeys,
+                                               Set<String> presentPackages, Set<String> presentClasses,
+                                               Set<String> presentExpandedClasses, Set<String> presentLowerTitles,
+                                               Set<Integer> presentItemIds, Set<String> multiEntryPackages) {
+        if (presentKeys.contains(rt.key)) return true;
+        String exact = normKey(rt.packageName, rt.className, rt.itemId);
+        if (!exact.isEmpty() && presentKeys.contains(exact)) return true;
+        if (!rt.className.isEmpty()) {
+            String exp = expandClass(rt.packageName, rt.className);
+            if (presentClasses.contains(rt.className) || presentExpandedClasses.contains(exp)) {
+                return true;
+            }
+        }
+        if (!rt.title.isEmpty() && presentLowerTitles.contains(rt.title.toLowerCase(Locale.US))) {
+            return true;
+        }
+        if (("com.hkmc.radio".equals(rt.packageName) || rt.packageName.startsWith("com.hkmc.radio."))
+                && presentLowerTitles.contains("radio")) {
+            return true;
+        }
+        boolean isMulti = "com.android.settings".equals(rt.packageName)
+                || (multiEntryPackages != null && multiEntryPackages.contains(rt.packageName));
+        if (!isMulti) {
+            if (presentPackages.contains(rt.packageName) || presentKeys.contains(rt.packageName + "/*")) {
+                return true;
+            }
+        } else if ("com.android.settings/com.android.settings.Settings".equals(rt.key)
+                && presentKeys.contains("com.android.settings/*")) {
+            return true;
+        }
+        return false;
     }
 
     @SuppressWarnings("unchecked")

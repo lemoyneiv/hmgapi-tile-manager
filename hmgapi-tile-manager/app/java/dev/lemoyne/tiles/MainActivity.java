@@ -4,14 +4,22 @@ import static dev.lemoyne.tiles.TileTheme.*;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -32,7 +40,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -43,15 +50,16 @@ import java.util.concurrent.Executors;
 
 /**
  * Material Design 3 widescreen automotive interface for Home Screen Tile Manager (1920x720 Gen5W):
- *  - Left M3 Navigation & Summary Rail: HMG-API status, Visible/Total hero card, Close Empty Gaps
- *    switch, and 3 category destinations (All Tiles, Packages & Mods, System Apps) with count badges
- *  - Right Contextual Pane: 2-column touch-friendly tile grid, Refresh & Show All actions, safety
- *    confirmation before hiding critical management apps, and instant live launcher/editor sync
+ *  - Left M3 Navigation & Summary Rail: author/version credit, compact Visible/Total & Close Empty
+ *    Gaps card, and 3 category destinations (All Home Tiles, Packages & Mods, System Apps)
+ *  - Right Contextual Pane: header with Refresh, Show All, and direct Edit Home Icons launcher
+ *    above a 2-column automotive visibility grid
  */
 public final class MainActivity extends Activity {
     private static final int TAB_ALL = 0;
     private static final int TAB_PACKAGES = 1;
     private static final int TAB_SYSTEM = 2;
+    private static final String PKG_HOME_EDITOR = "com.hkmc.system.app.homesetting";
 
     private static int activeTab = TAB_ALL;
 
@@ -60,10 +68,13 @@ public final class MainActivity extends Activity {
 
     private final List<TileWidgets.TileItem> catalogItems = new ArrayList<TileWidgets.TileItem>();
     private final Set<String> hiddenKeys = new LinkedHashSet<String>();
+
     private boolean compactGaps = true;
     private boolean hmgApiConnected;
     private boolean hookOutdated;
     private int saveGeneration;
+    private long lastSaveUptimeMs;
+    private boolean openingStockEditor;
 
     // Left rail views
     private TextView lblConnSub;
@@ -102,6 +113,9 @@ public final class MainActivity extends Activity {
                 ? android.R.style.Theme_Holo_NoActionBar
                 : android.R.style.Theme_Holo_Light_NoActionBar);
         super.onCreate(savedInstanceState);
+        if (activeTab < TAB_ALL || activeTab > TAB_SYSTEM) {
+            activeTab = TAB_ALL;
+        }
         setContentView(buildRoot());
         selectTab(activeTab);
     }
@@ -109,6 +123,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        openingStockEditor = false;
         TileCatalogProvider.setCatalogListener(providerCatalogCallback);
         reloadFromDisk(true);
     }
@@ -143,7 +158,7 @@ public final class MainActivity extends Activity {
         // 38dp right padding keeps controls clear of the Gen5W split-screen drawer handle
         root.setPadding(d(14), d(8), d(38), d(8));
 
-        root.addView(buildLeftRail(), new LinearLayout.LayoutParams(d(316), ViewGroup.LayoutParams.MATCH_PARENT));
+        root.addView(buildLeftRail(), new LinearLayout.LayoutParams(d(296), ViewGroup.LayoutParams.MATCH_PARENT));
 
         LinearLayout right = new LinearLayout(this);
         right.setOrientation(LinearLayout.VERTICAL);
@@ -174,40 +189,42 @@ public final class MainActivity extends Activity {
         LinearLayout rail = new LinearLayout(this);
         rail.setOrientation(LinearLayout.VERTICAL);
         rail.setBackground(shape(SURFACE_LOW, OUTLINE_VAR, Math.max(1, d(1)), d(22)));
-        int pad = d(14);
-        rail.setPadding(pad, d(13), pad, d(13));
+        int pad = d(13);
+        rail.setPadding(pad, d(12), pad, d(12));
 
-        // 1. Brand row + author credit
+        // 1. Brand row + author & version credit
         LinearLayout brand = new LinearLayout(this);
         brand.setOrientation(LinearLayout.HORIZONTAL);
         brand.setGravity(Gravity.CENTER_VERTICAL);
-        brand.addView(TileWidgets.iconBadge(this, TileIcons.GRID_ALL, PRIMARY_CONT, ON_PRIMARY_CONT, 44, 22));
+        brand.addView(TileWidgets.iconBadge(this, TileIcons.GRID_ALL, PRIMARY_CONT, ON_PRIMARY_CONT, 40, 20));
 
         LinearLayout brandText = new LinearLayout(this);
         brandText.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams btp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        btp.leftMargin = d(11);
+        btp.leftMargin = d(10);
 
         TextView title = new TextView(this);
         title.setText("Tile Manager");
         title.setTextColor(ON_SURFACE);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17.5f);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setSingleLine(true);
         brandText.addView(title);
 
         TextView lblAuthor = new TextView(this);
-        lblAuthor.setText("by lemoyneiv");
+        lblAuthor.setText("by lemoyneiv · v1.0.5");
         lblAuthor.setTextColor(ON_SURFACE_VAR);
         lblAuthor.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         lblAuthor.setSingleLine(true);
         brandText.addView(lblAuthor);
 
         lblConnSub = new TextView(this);
-        lblConnSub.setText("Checking HMG-API…");
-        lblConnSub.setTextColor(ON_SURFACE_VAR);
-        lblConnSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        lblConnSub.setText("");
+        lblConnSub.setTextColor(WARN);
+        lblConnSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        lblConnSub.setTypeface(Typeface.DEFAULT_BOLD);
         lblConnSub.setSingleLine(true);
+        lblConnSub.setVisibility(View.GONE);
         LinearLayout.LayoutParams csp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         csp.topMargin = d(1);
@@ -216,14 +233,14 @@ public final class MainActivity extends Activity {
         brand.addView(brandText, btp);
         rail.addView(brand);
 
-        // 2. Hero Visibility & Gap-Compaction Card
+        // 2. Compact Visibility & Gap-Compaction Card
         LinearLayout hero = new LinearLayout(this);
         hero.setOrientation(LinearLayout.VERTICAL);
-        hero.setBackground(shape(SURFACE_HIGH, OUTLINE_VAR, Math.max(1, d(1)), d(18)));
-        hero.setPadding(d(14), d(12), d(14), d(11));
+        hero.setBackground(shape(SURFACE_HIGH, OUTLINE_VAR, Math.max(1, d(1)), d(16)));
+        hero.setPadding(d(12), d(10), d(12), d(10));
         LinearLayout.LayoutParams heroLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        heroLp.topMargin = d(12);
+        heroLp.topMargin = d(11);
 
         LinearLayout countRow = new LinearLayout(this);
         countRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -232,7 +249,7 @@ public final class MainActivity extends Activity {
         lblHeroCount = new TextView(this);
         lblHeroCount.setText("—");
         lblHeroCount.setTextColor(ON_SURFACE);
-        lblHeroCount.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f);
+        lblHeroCount.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f);
         lblHeroCount.setTypeface(Typeface.DEFAULT_BOLD);
         lblHeroCount.setSingleLine(true);
         countRow.addView(lblHeroCount, new LinearLayout.LayoutParams(
@@ -242,20 +259,11 @@ public final class MainActivity extends Activity {
         countRow.addView(lblHeroChip);
         hero.addView(countRow);
 
-        TextView heroSub = new TextView(this);
-        heroSub.setText("Hidden tiles are backed up and restored automatically.");
-        heroSub.setTextColor(ON_SURFACE_VAR);
-        heroSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
-        LinearLayout.LayoutParams hsp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        hsp.topMargin = d(4);
-        hero.addView(heroSub, hsp);
-
         View div = new View(this);
         div.setBackgroundColor(OUTLINE_VAR);
         LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, d(1)));
-        dp.topMargin = d(10);
-        dp.bottomMargin = d(8);
+        dp.topMargin = d(8);
+        dp.bottomMargin = d(7);
         hero.addView(div, dp);
 
         // Close Empty Gaps switch row inside hero card
@@ -265,18 +273,18 @@ public final class MainActivity extends Activity {
 
         View gapIcon = new View(this);
         gapIcon.setBackground(new TileIcons(TileIcons.COMPACT, PRIMARY));
-        gapRow.addView(gapIcon, new LinearLayout.LayoutParams(d(18), d(18)));
+        gapRow.addView(gapIcon, new LinearLayout.LayoutParams(d(17), d(17)));
 
         LinearLayout gapCols = new LinearLayout(this);
         gapCols.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams gcp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        gcp.leftMargin = d(9);
+        gcp.leftMargin = d(8);
         gcp.rightMargin = d(6);
 
         TextView gapTitle = new TextView(this);
         gapTitle.setText("Close Empty Gaps");
         gapTitle.setTextColor(ON_SURFACE);
-        gapTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        gapTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
         gapTitle.setTypeface(Typeface.DEFAULT_BOLD);
         gapTitle.setSingleLine(true);
         gapCols.addView(gapTitle);
@@ -284,7 +292,7 @@ public final class MainActivity extends Activity {
         TextView gapSub = new TextView(this);
         gapSub.setText("Shift remaining tiles left");
         gapSub.setTextColor(ON_SURFACE_VAR);
-        gapSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        gapSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
         gapSub.setSingleLine(true);
         gapCols.addView(gapSub);
         gapRow.addView(gapCols, gcp);
@@ -293,7 +301,7 @@ public final class MainActivity extends Activity {
             @Override
             public void onToggle(boolean checked) {
                 compactGaps = checked;
-                persistAndBroadcast();
+                persistAndBroadcast(false, null, checked);
             }
         });
         gapRow.addView(swCompactGaps);
@@ -304,18 +312,18 @@ public final class MainActivity extends Activity {
                 boolean next = !compactGaps;
                 compactGaps = next;
                 swCompactGaps.setChecked(next, true);
-                persistAndBroadcast();
+                persistAndBroadcast(false, null, next);
             }
         });
         hero.addView(gapRow);
         rail.addView(hero, heroLp);
 
-        // 3. M3 Navigation Destinations
+        // 3. M3 Navigation Destinations (3 categories with generous headroom on 240dpi & 160dpi 720p)
         LinearLayout navBox = new LinearLayout(this);
         navBox.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams navLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        navLp.topMargin = d(12);
+        navLp.topMargin = d(10);
         navLp.gravity = Gravity.BOTTOM;
 
         View spacer = new View(this);
@@ -333,7 +341,7 @@ public final class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(d(14), 0, d(12), 0);
+        row.setPadding(d(12), 0, d(10), 0);
         row.setClickable(true);
         row.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -345,19 +353,19 @@ public final class MainActivity extends Activity {
         TileIcons ic = new TileIcons(iconKind, ON_SURFACE_VAR);
         View iv = new View(this);
         iv.setBackground(ic);
-        row.addView(iv, new LinearLayout.LayoutParams(d(20), d(20)));
+        row.addView(iv, new LinearLayout.LayoutParams(d(19), d(19)));
 
         TextView tv = new TextView(this);
         tv.setText(label);
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
         tv.setSingleLine(true);
         LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        tp.leftMargin = d(12);
+        tp.leftMargin = d(11);
         row.addView(tv, tp);
 
         TextView badge = new TextView(this);
         badge.setText("0");
-        badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         badge.setTypeface(Typeface.DEFAULT_BOLD);
         badge.setPadding(d(8), d(2), d(8), d(2));
         row.addView(badge);
@@ -368,8 +376,8 @@ public final class MainActivity extends Activity {
         navBadges[idx] = badge;
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, d(46));
-        if (idx > 0) lp.topMargin = d(5);
+                ViewGroup.LayoutParams.MATCH_PARENT, d(42));
+        if (idx > 0) lp.topMargin = d(4);
         row.setLayoutParams(lp);
         return row;
     }
@@ -435,19 +443,28 @@ public final class MainActivity extends Activity {
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
-                        if (hiddenKeys.isEmpty()) {
-                            Toast.makeText(MainActivity.this, "All tiles are already visible.", Toast.LENGTH_SHORT).show();
-                            return;
-                        }
                         hiddenKeys.clear();
                         renderAll();
-                        persistAndBroadcast();
+                        persistAndBroadcast(true, null, false);
                     }
                 });
         LinearLayout.LayoutParams sap = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         sap.rightMargin = d(8);
         header.addView(btnShowAll, sap);
+
+        LinearLayout btnEditHomeIcons = TileWidgets.m3Button(
+                this, TileIcons.ARRANGE, "Edit Home Icons", TileWidgets.BTN_FILLED, 38,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        onEditHomeIconsClicked();
+                    }
+                });
+        LinearLayout.LayoutParams ehp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ehp.rightMargin = d(8);
+        header.addView(btnEditHomeIcons, ehp);
 
         FrameLayout btnClose = TileWidgets.circleIconButton(
                 this, TileIcons.CLOSE, SURFACE_HIGH, ON_SURFACE, OUTLINE_VAR, 38,
@@ -462,11 +479,12 @@ public final class MainActivity extends Activity {
     }
 
     private void selectTab(int tab) {
+        if (tab < TAB_ALL || tab > TAB_SYSTEM) tab = TAB_ALL;
         activeTab = tab;
         for (int i = 0; i < 3; i++) {
             boolean sel = (i == tab);
             navItems[i].setBackground(interactiveShape(
-                    sel ? SECONDARY_CONT : Color.TRANSPARENT, 0, 0, d(23), STATE_ON_SURFACE));
+                    sel ? SECONDARY_CONT : Color.TRANSPARENT, 0, 0, d(21), STATE_ON_SURFACE));
             navIcons[i].setColor(sel ? ON_SECONDARY_CONT : ON_SURFACE_VAR);
             navLabels[i].setTextColor(sel ? ON_SECONDARY_CONT : ON_SURFACE_VAR);
             navLabels[i].setTypeface(sel ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
@@ -476,15 +494,181 @@ public final class MainActivity extends Activity {
         }
         if (tab == TAB_PACKAGES) {
             pageTitle.setText("Packages & Mods");
-            pageSubtitle.setText("HMG-API mods, NEMESIS shortcuts, and user-installed apps on the Gen5W home screen.");
+            pageSubtitle.setText("HMG-API mods, NEMESIS shortcuts, and user-installed apps on the Home Screen.");
         } else if (tab == TAB_SYSTEM) {
             pageTitle.setText("System Apps");
-            pageSubtitle.setText("Built-in head-unit apps — toggle OFF to hide from both Home Screen and Menu Editor.");
+            pageSubtitle.setText("Built-in head-unit apps — toggle OFF to hide from Home Screen and Menu Editor.");
         } else {
             pageTitle.setText("All Home Tiles");
-            pageSubtitle.setText("Toggle any tile OFF to hide it live; toggle ON to restore it to its saved slot.");
+            pageSubtitle.setText("Toggle tiles OFF to hide live, or tap Edit Home Icons to arrange pages.");
         }
         renderGrid();
+    }
+
+    // ---- Stock Edit Home Icons Launcher Punch-Out ----
+
+    private void onEditHomeIconsClicked() {
+        if (openingStockEditor) return;
+        long elapsed = SystemClock.uptimeMillis() - lastSaveUptimeMs;
+        if (lastSaveUptimeMs > 0L && elapsed >= 0L && elapsed < 550L) {
+            // Wait briefly for com.android.launcher3's 150ms ALL_MENU write to finish so
+            // com.hkmc.system.app.homesetting loads the freshly synced tile state.
+            openingStockEditor = true;
+            lblSaveStatus.setText("Syncing tiles…");
+            lblSaveStatus.setTextColor(PRIMARY);
+            long waitMs = Math.min(550L, 550L - elapsed + 40L);
+            ui.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    openingStockEditor = false;
+                    if (!isFinishing()) {
+                        lblSaveStatus.setText("");
+                        launchStockIconEditor();
+                    }
+                }
+            }, waitMs);
+            return;
+        }
+        launchStockIconEditor();
+    }
+
+    private void launchStockIconEditor() {
+        final ActivityInfo best = findBestHomeEditorActivity();
+        if (best != null && canLaunchDirectly(best)) {
+            try {
+                String fullCls = best.name.startsWith(".")
+                        ? (best.packageName + best.name) : best.name;
+                Intent editIntent = new Intent(Intent.ACTION_MAIN);
+                editIntent.setClassName(best.packageName, fullCls);
+                editIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                startActivity(editIntent);
+                return;
+            } catch (Throwable ignored) {
+                // Fall through to system-UID hook broadcast if firmware restricts direct launch
+            }
+        }
+
+        // Privileged fallback: wake com.hkmc.system.app.homesetting via ALL_MENU so its
+        // system-UID hook receiver (or com.android.launcher3's receiver) opens the activity.
+        openingStockEditor = true;
+        io.execute(new Runnable() {
+            @Override
+            public void run() {
+                Cursor cur = null;
+                try {
+                    cur = getContentResolver().query(
+                            TileCatalogProvider.ALL_MENU, new String[] { "userName" }, null, null, null);
+                } catch (Throwable ignored) {
+                } finally {
+                    if (cur != null) cur.close();
+                }
+
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        openingStockEditor = false;
+                        if (isFinishing()) return;
+                        Intent req = new Intent(TileCatalogProvider.ACTION_OPEN_STOCK_EDITOR);
+                        req.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+                        if (best != null) {
+                            String fullCls = best.name.startsWith(".")
+                                    ? (best.packageName + best.name) : best.name;
+                            req.putExtra("component_pkg", best.packageName);
+                            req.putExtra("component_cls", fullCls);
+                        }
+                        sendOrderedBroadcast(req, null, new BroadcastReceiver() {
+                            @Override
+                            public void onReceive(Context context, Intent intent) {
+                                if (isFinishing() || getResultCode() == Activity.RESULT_OK) return;
+                                try {
+                                    Intent fallback = getPackageManager().getLaunchIntentForPackage(PKG_HOME_EDITOR);
+                                    if (fallback != null) {
+                                        fallback.setFlags((fallback.getFlags() & ~Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                                        startActivity(fallback);
+                                        return;
+                                    }
+                                } catch (Throwable ignored) {}
+                                Toast.makeText(
+                                        MainActivity.this,
+                                        hookOutdated
+                                                ? "Reboot once to finish updating Tile Manager, or open Home Screen → Menu → Edit Home Icons."
+                                                : "Open Home Screen → Menu → Edit Home Icons to arrange tiles.",
+                                        Toast.LENGTH_LONG).show();
+                            }
+                        }, ui, Activity.RESULT_CANCELED, null, null);
+                    }
+                });
+            }
+        });
+    }
+
+    private boolean canLaunchDirectly(ActivityInfo ai) {
+        if (ai == null || !ai.exported) return false;
+        if (ai.permission == null || ai.permission.isEmpty()) return true;
+        try {
+            return checkPermission(ai.permission, Process.myPid(), Process.myUid())
+                    == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private ActivityInfo findBestHomeEditorActivity() {
+        try {
+            PackageManager pm = getPackageManager();
+            PackageInfo pi = pm.getPackageInfo(PKG_HOME_EDITOR, PackageManager.GET_ACTIVITIES);
+            String launchCls = "";
+            try {
+                Intent li = pm.getLaunchIntentForPackage(PKG_HOME_EDITOR);
+                if (li != null && li.getComponent() != null) {
+                    launchCls = li.getComponent().getClassName();
+                }
+            } catch (Throwable ignored) {}
+
+            ActivityInfo best = null;
+            int bestScore = -1;
+            if (pi != null && pi.activities != null) {
+                for (ActivityInfo ai : pi.activities) {
+                    if (ai == null || !ai.enabled || ai.name == null) continue;
+                    String fullName = ai.name.startsWith(".") ? (PKG_HOME_EDITOR + ai.name) : ai.name;
+                    String lowName = fullName.toLowerCase(Locale.US);
+                    String lowLabel = "";
+                    try {
+                        CharSequence cs = ai.loadLabel(pm);
+                        if (cs != null) lowLabel = cs.toString().trim().toLowerCase(Locale.US);
+                    } catch (Throwable ignored) {}
+
+                    int score;
+                    if (lowName.contains("allmenuedit")) {
+                        score = 110;
+                    } else if (lowName.contains("menuedit") || lowName.contains("iconedit")
+                            || lowName.contains("editicon") || lowName.contains("homeicon")) {
+                        score = 100;
+                    } else if (lowLabel.contains("home icon") || lowLabel.contains("menu icon")
+                            || lowLabel.contains("edit icon") || lowLabel.contains("all menu")) {
+                        score = 90;
+                    } else if (lowName.contains("allmenu")
+                            || (lowName.contains("edit") && !lowName.contains("widget") && !lowName.contains("split"))) {
+                        score = 75;
+                    } else if (launchCls != null && !launchCls.isEmpty() && launchCls.equals(fullName)) {
+                        score = 45;
+                    } else if (!lowName.contains("widget") && !lowName.contains("split")) {
+                        score = 30;
+                    } else {
+                        score = 10;
+                    }
+                    if (ai.exported) score += 3;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = ai;
+                    }
+                }
+            }
+            return best;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     // ---- Data Loading & Live Persistence ----
@@ -705,6 +889,15 @@ public final class MainActivity extends Activity {
     }
 
     private void persistAndBroadcast() {
+        persistAndBroadcast(false, null, false);
+    }
+
+    private void persistAndBroadcast(final boolean forceRestoreAll, final String unhiddenKey) {
+        persistAndBroadcast(forceRestoreAll, unhiddenKey, false);
+    }
+
+    private void persistAndBroadcast(final boolean forceRestoreAll, final String unhiddenKey,
+                                     final boolean forceCompact) {
         final boolean snapCompact = compactGaps;
         final Set<String> snapHidden = new LinkedHashSet<String>();
         for (String hk : hiddenKeys) {
@@ -716,6 +909,7 @@ public final class MainActivity extends Activity {
         hiddenKeys.clear();
         hiddenKeys.addAll(snapHidden);
         final int gen = ++saveGeneration;
+        lastSaveUptimeMs = SystemClock.uptimeMillis();
 
         lblSaveStatus.setText("Applying live…");
         lblSaveStatus.setTextColor(PRIMARY);
@@ -731,6 +925,15 @@ public final class MainActivity extends Activity {
                 try {
                     Intent changed = new Intent(TileCatalogProvider.ACTION_TILES_CHANGED);
                     changed.putExtra("config_json", configPayload);
+                    if (forceRestoreAll) {
+                        changed.putExtra("force_restore_all", true);
+                    }
+                    if (forceCompact) {
+                        changed.putExtra("force_compact", true);
+                    }
+                    if (unhiddenKey != null && !unhiddenKey.isEmpty()) {
+                        changed.putExtra("unhidden_key", unhiddenKey);
+                    }
                     sendBroadcast(changed);
                 } catch (Throwable ignored) {}
 
@@ -756,7 +959,13 @@ public final class MainActivity extends Activity {
                         if (isFinishing() || gen != saveGeneration) return;
                         hmgApiConnected = okDaemon || hmgApiConnected;
                         updateRailHeader();
-                        showStatus("Home screen updated");
+                        showStatus(forceRestoreAll ? "All tiles restored" : "Home screen updated");
+                        ui.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (!isFinishing()) reloadFromDisk(false, true);
+                            }
+                        }, 550);
                     }
                 });
             }
@@ -787,14 +996,12 @@ public final class MainActivity extends Activity {
 
     private void updateRailHeader() {
         if (hookOutdated) {
-            lblConnSub.setText("● Reboot Required · v1.0.4");
+            lblConnSub.setText("Reboot required to finish update");
             lblConnSub.setTextColor(WARN);
-        } else if (hmgApiConnected) {
-            lblConnSub.setText("● HMG-API Live · v1.0.4");
-            lblConnSub.setTextColor(OK);
+            lblConnSub.setVisibility(View.VISIBLE);
         } else {
-            lblConnSub.setText("● Local Mode · v1.0.4");
-            lblConnSub.setTextColor(ON_SURFACE_VAR);
+            lblConnSub.setText("");
+            lblConnSub.setVisibility(View.GONE);
         }
     }
 
@@ -819,7 +1026,7 @@ public final class MainActivity extends Activity {
             lblHeroChip.setText("All Shown");
             lblHeroChip.setBackground(shape(OK_CONT, 0, 0, d(8)));
             lblHeroChip.setTextColor(ON_OK_CONT);
-            btnShowAll.setAlpha(0.55f);
+            btnShowAll.setAlpha(0.82f);
         } else {
             lblHeroChip.setText(totalHidden + " Hidden");
             lblHeroChip.setBackground(shape(WARN_CONT, 0, 0, d(8)));
@@ -907,7 +1114,7 @@ public final class MainActivity extends Activity {
         if (visible) {
             setItemHiddenState(item, false);
             updateCountsAndBadges();
-            persistAndBroadcast();
+            persistAndBroadcast(false, item.key);
             return;
         }
 
