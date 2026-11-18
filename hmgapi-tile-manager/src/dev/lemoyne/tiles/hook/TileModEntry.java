@@ -66,8 +66,13 @@ public final class TileModEntry extends ModEntry {
         final String kind;
         final String modId;
         final int itemId;
+        final String iconPkg;
+        final String iconType;
+        final String iconName;
+        final int iconId;
 
-        EntryMeta(String key, String pkg, String cls, String title, String kind, String modId, int itemId) {
+        EntryMeta(String key, String pkg, String cls, String title, String kind, String modId,
+                  int itemId, String iconPkg, String iconType, String iconName, int iconId) {
             this.key = key;
             this.pkg = pkg;
             this.cls = cls;
@@ -75,6 +80,10 @@ public final class TileModEntry extends ModEntry {
             this.kind = kind;
             this.modId = modId;
             this.itemId = itemId;
+            this.iconPkg = iconPkg == null ? "" : iconPkg;
+            this.iconType = iconType == null ? "" : iconType;
+            this.iconName = iconName == null ? "" : iconName;
+            this.iconId = iconId;
         }
     }
 
@@ -140,7 +149,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("launcher tile manager v1.0.3 active in " + app.processName);
+        mod.log("launcher tile manager v1.0.4 active in " + app.processName);
     }
 
     private void hookEditor(final ModContext mod, final LoadedApp app) {
@@ -175,7 +184,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("menu editor tile manager v1.0.3 active in " + app.processName);
+        mod.log("menu editor tile manager v1.0.4 active in " + app.processName);
     }
 
     private static void hookEntryCtor(final ModContext mod, ClassLoader cl, String pointId,
@@ -191,7 +200,7 @@ public final class TileModEntry extends ModEntry {
                     int iconId = param.args[4] instanceof Integer ? ((Integer) param.args[4]).intValue() : 0;
                     int iconDisId = param.args[5] instanceof Integer ? ((Integer) param.args[5]).intValue() : 0;
                     int titleId = param.args[6] instanceof Integer ? ((Integer) param.args[6]).intValue() : 0;
-                    EntryMeta meta = buildMeta(ctx, pkg, cls, titleId, null, -1);
+                    EntryMeta meta = buildMeta(ctx, pkg, cls, iconId, titleId, null, -1);
                     inspector.calibrate(param.thisObject, pkg, cls, iconId, iconDisId, titleId, meta.title);
                     cacheMeta(param.thisObject, meta);
                 } catch (Throwable t) {
@@ -227,9 +236,10 @@ public final class TileModEntry extends ModEntry {
         if (entry == null) return null;
 
         TileStore.EntryInspector.Extracted ex = inspector.extract(
-                entry, inv, alreadyMatchedKeys, resourceStringProbe(ctx));
+                entry, inv, alreadyMatchedKeys, resourceStringProbe(ctx), resourceDrawableProbe(ctx));
         String pkg = ex != null ? ex.pkg : "";
         String cls = ex != null ? ex.cls : "";
+        int iconId = ex != null ? ex.iconId : 0;
         int titleId = ex != null ? ex.titleId : 0;
         String titleText = ex != null ? ex.titleText : "";
         int itemId = ex != null ? ex.matchedItemId : -1;
@@ -259,7 +269,7 @@ public final class TileModEntry extends ModEntry {
             }
         }
 
-        EntryMeta built = buildMeta(ctx, pkg, cls, titleId, titleText, itemId);
+        EntryMeta built = buildMeta(ctx, pkg, cls, iconId, titleId, titleText, itemId);
         if (!built.key.isEmpty()) {
             cacheMeta(entry, built);
         }
@@ -289,12 +299,52 @@ public final class TileModEntry extends ModEntry {
         };
     }
 
+    private static TileStore.IntDrawableProbe resourceDrawableProbe(final Context ctx) {
+        if (ctx == null) return null;
+        return new TileStore.IntDrawableProbe() {
+            @Override
+            public String resolveDrawableEntryName(int resId) {
+                if (resId == 0 || (resId & 0xffff0000) == 0x7f7e0000) return null;
+                try {
+                    Resources res = ctx.getResources();
+                    String type = res.getResourceTypeName(resId);
+                    if (!"drawable".equals(type) && !"mipmap".equals(type)) return null;
+                    return res.getResourceEntryName(resId);
+                } catch (Throwable ignored) {
+                    return null;
+                }
+            }
+        };
+    }
+
     private static EntryMeta buildMeta(Context ctx, String rawPkg, String rawCls,
+                                       int titleId, String fallbackTitleText, int itemId) {
+        return buildMeta(ctx, rawPkg, rawCls, 0, titleId, fallbackTitleText, itemId);
+    }
+
+    private static EntryMeta buildMeta(Context ctx, String rawPkg, String rawCls, int iconId,
                                        int titleId, String fallbackTitleText, int itemId) {
         String pkg = TileStore.cleanToken(rawPkg);
         String cls = TileStore.cleanToken(rawCls);
         String key = TileStore.normKey(pkg, cls, itemId);
         String title = null;
+        String iconPkg = "";
+        String iconType = "";
+        String iconName = "";
+        int resolvedIconId = 0;
+
+        if (ctx != null && iconId != 0 && (iconId & 0xffff0000) != 0x7f7e0000) {
+            try {
+                Resources res = ctx.getResources();
+                String rType = res.getResourceTypeName(iconId);
+                if ("drawable".equals(rType) || "mipmap".equals(rType)) {
+                    iconPkg = TileStore.cleanToken(res.getResourcePackageName(iconId));
+                    iconType = rType;
+                    iconName = TileStore.cleanToken(res.getResourceEntryName(iconId));
+                    resolvedIconId = iconId;
+                }
+            } catch (Throwable ignored) {}
+        }
 
         if (ctx != null && titleId != 0) {
             try {
@@ -366,7 +416,8 @@ public final class TileModEntry extends ModEntry {
             }
         }
 
-        return new EntryMeta(key, pkg, cls, title, kind, modId, itemId);
+        return new EntryMeta(key, pkg, cls, title, kind, modId, itemId,
+                iconPkg, iconType, iconName, resolvedIconId);
     }
 
     private static TileStore.ModLauncherSpec findModLauncherSpec(String pkg, String cls) {
@@ -679,6 +730,10 @@ public final class TileModEntry extends ModEntry {
         row.put("title", m.title);
         row.put("kind", m.kind);
         if (m.modId != null) row.put("mod", m.modId);
+        if (!m.iconPkg.isEmpty()) row.put("iconPkg", m.iconPkg);
+        if (!m.iconType.isEmpty()) row.put("iconType", m.iconType);
+        if (!m.iconName.isEmpty()) row.put("iconName", m.iconName);
+        if (m.iconId != 0) row.put("iconId", Long.valueOf(m.iconId));
         catalogByKey.put(m.key, row);
     }
 

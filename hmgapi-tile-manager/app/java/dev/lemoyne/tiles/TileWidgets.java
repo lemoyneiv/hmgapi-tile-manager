@@ -3,9 +3,7 @@ package dev.lemoyne.tiles;
 import static dev.lemoyne.tiles.TileTheme.*;
 
 import android.animation.ValueAnimator;
-import android.content.ComponentName;
 import android.content.Context;
-import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -28,7 +26,7 @@ import android.widget.TextView;
 /**
  * Material Design 3 components built natively for Android API 19 (KitKat):
  * - M3Switch: animated 52x32dp stadium switch with 16->24->28dp thumb, state halo & checkmark
- * - TileCardView: Gen5W launcher tile card with live PackageManager icon, mod/system badge & switch
+ * - TileCardView: Gen5W launcher tile card with live Launcher_WP3 / PackageManager icon, mod/system badge & switch
  * - M3 Filled, Tonal, Outlined, and Circular Icon buttons with pressed state layers
  */
 final class TileWidgets {
@@ -48,9 +46,19 @@ final class TileWidgets {
         final String kind; // "package" or "system"
         final String modId;
         final boolean orphan;
+        final String iconPkg;
+        final String iconType;
+        final String iconName;
+        final int iconId;
 
         TileItem(String key, String packageName, String className, String title,
                  String kind, String modId, boolean orphan) {
+            this(key, packageName, className, title, kind, modId, orphan, "", "", "", 0);
+        }
+
+        TileItem(String key, String packageName, String className, String title,
+                 String kind, String modId, boolean orphan,
+                 String iconPkg, String iconType, String iconName, int iconId) {
             this.key = key;
             this.packageName = packageName;
             this.className = className;
@@ -58,6 +66,10 @@ final class TileWidgets {
             this.kind = kind;
             this.modId = modId;
             this.orphan = orphan;
+            this.iconPkg = iconPkg != null ? iconPkg : "";
+            this.iconType = iconType != null ? iconType : "";
+            this.iconName = iconName != null ? iconName : "";
+            this.iconId = iconId;
         }
 
         boolean isPackage() {
@@ -331,40 +343,27 @@ final class TileWidgets {
 
         private static FrameLayout buildTileIconBox(Context c, TileItem item) {
             FrameLayout box = new FrameLayout(c);
-            int bg = item.isPackage() ? withAlpha(TERTIARY_CONT, night ? 150 : 190) : SURFACE_HIGH;
+            int bg = item.isPackage()
+                    ? withAlpha(TERTIARY_CONT, night ? 150 : 190)
+                    : (night ? 0xFF1A202B : 0xFFF2F5FA);
             box.setBackground(shape(bg, OUTLINE_VAR, Math.max(1, dp(c, 1)), dp(c, 13)));
             box.setLayoutParams(new LayoutParams(dp(c, 44), dp(c, 44)));
 
-            Drawable appIcon = loadInstalledIcon(c, item.packageName, item.className);
-            if (appIcon != null) {
-                ImageView iv = new ImageView(c);
-                iv.setImageDrawable(appIcon);
-                iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                box.addView(iv, new FrameLayout.LayoutParams(dp(c, 32), dp(c, 32), Gravity.CENTER));
-            } else {
+            SystemIconResolver.ResolvedIcon resolved = SystemIconResolver.resolve(c, item);
+            Drawable icon = resolved.drawable;
+            if (resolved.isVector) {
                 View vec = new View(c);
-                vec.setBackground(new TileIcons(
-                        item.isPackage() ? TileIcons.PACKAGE : TileIcons.SYSTEM,
-                        item.isPackage() ? ON_TERTIARY_CONT : ON_SURFACE_VAR));
-                box.addView(vec, new FrameLayout.LayoutParams(dp(c, 22), dp(c, 22), Gravity.CENTER));
+                vec.setBackground(icon);
+                int vecDp = item.isPackage() ? 22 : 25;
+                box.addView(vec, new FrameLayout.LayoutParams(dp(c, vecDp), dp(c, vecDp), Gravity.CENTER));
+            } else if (icon != null) {
+                ImageView iv = new ImageView(c);
+                iv.setImageDrawable(icon);
+                iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                int imgDp = resolved.isLauncherPlate ? 38 : 32;
+                box.addView(iv, new FrameLayout.LayoutParams(dp(c, imgDp), dp(c, imgDp), Gravity.CENTER));
             }
             return box;
-        }
-
-        private static Drawable loadInstalledIcon(Context c, String pkg, String cls) {
-            if (pkg == null || pkg.isEmpty()) return null;
-            PackageManager pm = c.getPackageManager();
-            if (cls != null && !cls.isEmpty() && !"*".equals(cls)) {
-                String fullCls = cls.startsWith(".") ? pkg + cls : cls;
-                try {
-                    return pm.getActivityIcon(new ComponentName(pkg, fullCls));
-                } catch (Throwable ignored) {}
-            }
-            try {
-                return pm.getApplicationIcon(pkg);
-            } catch (Throwable ignored) {
-                return null;
-            }
         }
 
         private static String kindLabel(TileItem item) {

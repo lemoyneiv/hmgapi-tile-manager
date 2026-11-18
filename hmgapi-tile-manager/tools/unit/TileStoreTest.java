@@ -464,6 +464,29 @@ public final class TileStoreTest {
         check("two custom driver profiles keep both while omitting Guest",
                 Integer.valueOf(2), Integer.valueOf(selectedTwoCustom.size()));
 
+        // 17. v1.0.4 regressions: EntryInspector enabled iconId calibration & IntDrawableProbe disambiguation
+        check("8-arg Notifications extracts enabled iconId (not disabled 0x7f020011)",
+                Integer.valueOf(0x7f020010), Integer.valueOf(exNotif.iconId));
+        check("6-arg Navigation Menu extracts enabled iconId (not disabled 0x7f020013)",
+                Integer.valueOf(0x7f020012), Integer.valueOf(exNavi.iconId));
+
+        TileStore.EntryInspector uncalInspector = new TileStore.EntryInspector();
+        MockQ radioWithIcons = MockQ.ctor8Badge("com.hkmc.radio", ".RadioActivity",
+                0x7f020041, 0x7f020042, 0x7f080024, 0);
+        // Swap order so disabled icon appears in an earlier field or probe both:
+        TileStore.IntDrawableProbe drawProbe = new TileStore.IntDrawableProbe() {
+            @Override
+            public String resolveDrawableEntryName(int resId) {
+                if (resId == 0x7f020041) return "hom_radio_66_dis";
+                if (resId == 0x7f020042) return "hom_radio_66";
+                return null;
+            }
+        };
+        TileStore.EntryInspector.Extracted exProbe = uncalInspector.extract(
+                radioWithIcons, i5Inv, Collections.<String>emptySet(), radioProbe, drawProbe);
+        check("IntDrawableProbe skips _dis icon and picks enabled hom_radio_66",
+                Integer.valueOf(0x7f020042), Integer.valueOf(exProbe.iconId));
+
         System.out.println("TileStoreTest: " + checks + " checks passed");
     }
 

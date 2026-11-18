@@ -141,6 +141,10 @@ public final class TileStore {
         String resolveStringResource(int resId);
     }
 
+    public interface IntDrawableProbe {
+        String resolveDrawableEntryName(int resId);
+    }
+
     public interface ItemVisibilityFilter {
         boolean shouldShow(Object item);
         void onItemAdded(Object item);
@@ -282,13 +286,19 @@ public final class TileStore {
         public static final class Extracted {
             public final String pkg;
             public final String cls;
+            public final int iconId;
             public final int titleId;
             public final String titleText;
             public final int matchedItemId;
 
             public Extracted(String pkg, String cls, int titleId, String titleText, int matchedItemId) {
+                this(pkg, cls, 0, titleId, titleText, matchedItemId);
+            }
+
+            public Extracted(String pkg, String cls, int iconId, int titleId, String titleText, int matchedItemId) {
                 this.pkg = cleanToken(pkg);
                 this.cls = cleanToken(cls);
+                this.iconId = iconId;
                 this.titleId = titleId;
                 this.titleText = titleText == null ? "" : titleText.trim();
                 this.matchedItemId = matchedItemId;
@@ -298,6 +308,8 @@ public final class TileStore {
         private Set<Field> pkgCandidates;
         private Set<Field> clsCandidates;
         private Set<Field> compCandidates;
+        private Set<Field> iconIdCandidates;
+        private Set<Field> iconDisabledIdCandidates;
         private Set<Field> titleIdCandidates;
         private Set<Field> titleTextCandidates;
 
@@ -336,6 +348,34 @@ public final class TileStore {
                     }
                 }
                 if (!foundCls.isEmpty()) clsCandidates = narrow(clsCandidates, foundCls);
+            }
+
+            if (iconId != 0 && iconId != iconDisabledId && iconId != titleId) {
+                Set<Field> foundIco = new LinkedHashSet<Field>();
+                for (Field f : fields) {
+                    Class<?> t = f.getType();
+                    if (t == int.class || t == Integer.class) {
+                        Object val = readField(f, instance);
+                        if (val instanceof Number && ((Number) val).intValue() == iconId) {
+                            foundIco.add(f);
+                        }
+                    }
+                }
+                if (!foundIco.isEmpty()) iconIdCandidates = narrow(iconIdCandidates, foundIco);
+            }
+
+            if (iconDisabledId != 0 && iconDisabledId != iconId && iconDisabledId != titleId) {
+                Set<Field> foundDis = new LinkedHashSet<Field>();
+                for (Field f : fields) {
+                    Class<?> t = f.getType();
+                    if (t == int.class || t == Integer.class) {
+                        Object val = readField(f, instance);
+                        if (val instanceof Number && ((Number) val).intValue() == iconDisabledId) {
+                            foundDis.add(f);
+                        }
+                    }
+                }
+                if (!foundDis.isEmpty()) iconDisabledIdCandidates = narrow(iconDisabledIdCandidates, foundDis);
             }
 
             if (titleId != 0 && titleId != iconId && titleId != iconDisabledId) {
@@ -384,9 +424,17 @@ public final class TileStore {
 
         public synchronized Extracted extract(Object item, MenuInventory inv,
                                               Set<String> alreadyMatchedKeys, IntStringProbe stringProbe) {
+            return extract(item, inv, alreadyMatchedKeys, stringProbe, null);
+        }
+
+        public synchronized Extracted extract(Object item, MenuInventory inv,
+                                              Set<String> alreadyMatchedKeys,
+                                              IntStringProbe stringProbe,
+                                              IntDrawableProbe drawableProbe) {
             if (item == null) return null;
             String pkg = "";
             String cls = "";
+            int iconId = 0;
             int titleId = 0;
             String titleText = "";
             int matchedItemId = -1;
@@ -394,6 +442,8 @@ public final class TileStore {
             Field pf = firstApplicable(pkgCandidates, item);
             Field cf = firstApplicable(clsCandidates, item);
             Field compF = firstApplicable(compCandidates, item);
+            Field icoF = firstApplicable(iconIdCandidates, item);
+            Field disF = firstApplicable(iconDisabledIdCandidates, item);
             Field tidF = firstApplicable(titleIdCandidates, item);
             Field txtF = firstApplicable(titleTextCandidates, item);
 
@@ -404,6 +454,13 @@ public final class TileStore {
                 if (comp != null) {
                     if (pkg.isEmpty()) pkg = cleanToken(callZeroArgString(comp, "getPackageName"));
                     if (cls.isEmpty()) cls = cleanToken(callZeroArgString(comp, "getClassName"));
+                }
+            }
+            if (icoF != null) {
+                Object v = readField(icoF, item);
+                if (v instanceof Number) {
+                    int candidate = ((Number) v).intValue();
+                    if ((candidate & 0xffff0000) != 0x7f7e0000) iconId = candidate;
                 }
             }
             if (tidF != null) {
@@ -429,6 +486,10 @@ public final class TileStore {
                     if (cls.isEmpty()) cls = cleanToken(callZeroArgString(comp, "getClassName"));
                 }
             }
+            if (iconId == 0) {
+                Integer iid = firstIntGetter(item, "getIconId", "getIconResId", "getIconResource", "getImageId", "getImgId");
+                if (iid != null && (iid.intValue() & 0xffff0000) != 0x7f7e0000) iconId = iid.intValue();
+            }
             if (titleId == 0) {
                 Integer tid = firstIntGetter(item, "getTitleId", "getTitleResId", "getStringId");
                 if (tid != null) titleId = tid.intValue();
@@ -437,7 +498,7 @@ public final class TileStore {
                 titleText = firstNonEmptyGetter(item, "getTitle", "getLabel", "getAppName");
             }
 
-            // 3. Field scan for ComponentName, Intent, String pkg/cls/title, and string resource IDs
+            // 3. Field scan for ComponentName, Intent, String pkg/cls/title, and string/drawable resource IDs
             List<Field> allFields = allInstanceFields(item.getClass());
             if (pkg.isEmpty() || cls.isEmpty()) {
                 for (Field f : allFields) {
@@ -540,6 +601,31 @@ public final class TileStore {
                 }
             }
 
+            // Probe int fields for R.drawable.* / R.mipmap.* enabled icon resource IDs
+            if (iconId == 0 && drawableProbe != null) {
+                int fallbackDisId = 0;
+                for (Field f : allFields) {
+                    if (f.equals(tidF) || f.equals(disF)) continue;
+                    Class<?> t = f.getType();
+                    if (t != int.class && t != Integer.class) continue;
+                    Object val = readField(f, item);
+                    if (!(val instanceof Number)) continue;
+                    int id = ((Number) val).intValue();
+                    if ((id & 0xff000000) != 0x7f000000 || (id & 0xffff0000) == 0x7f7e0000) continue;
+                    if (id == titleId) continue;
+                    String entryName = drawableProbe.resolveDrawableEntryName(id);
+                    if (entryName != null && !entryName.trim().isEmpty()) {
+                        if (!looksLikeDisabledDrawableName(entryName)) {
+                            iconId = id;
+                            break;
+                        } else if (fallbackDisId == 0) {
+                            fallbackDisId = id;
+                        }
+                    }
+                }
+                if (iconId == 0) iconId = fallbackDisId;
+            }
+
             String fullCls = expandClass(pkg, cls);
             if (titleText.isEmpty()) {
                 for (String s : extraStrings) {
@@ -576,7 +662,15 @@ public final class TileStore {
             }
 
             if (pkg.isEmpty() && cls.isEmpty() && matchedItemId <= 0) return null;
-            return new Extracted(pkg, cls, titleId, titleText, matchedItemId);
+            return new Extracted(pkg, cls, iconId, titleId, titleText, matchedItemId);
+        }
+
+        private static boolean looksLikeDisabledDrawableName(String entryName) {
+            if (entryName == null) return false;
+            String low = entryName.trim().toLowerCase(Locale.US);
+            return low.endsWith("_dis") || low.endsWith("_disabled") || low.endsWith("_disable")
+                    || low.endsWith("_dim") || low.endsWith("_off") || low.endsWith("_d")
+                    || low.contains("_dis_") || low.contains("_disabled_");
         }
 
         private static boolean isRecordAlreadyMatched(MenuEntryRecord rec, Set<String> alreadyMatchedKeys) {

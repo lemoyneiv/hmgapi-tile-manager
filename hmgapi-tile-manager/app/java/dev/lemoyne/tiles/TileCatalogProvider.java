@@ -330,8 +330,13 @@ public final class TileCatalogProvider extends ContentProvider {
                             }
                         }
                         String finalTitle = "system".equals(kind) ? friendlyTitle(title, pkg, cls) : title;
+                        String iconPkg = clean(row.optString("iconPkg", ""));
+                        String iconType = clean(row.optString("iconType", ""));
+                        String iconName = clean(row.optString("iconName", ""));
+                        int iconId = row.optInt("iconId", 0);
                         putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
-                                key, pkg, cls, finalTitle, kind, modId);
+                                key, pkg, cls, finalTitle, kind, modId,
+                                iconPkg, iconType, iconName, iconId);
                     }
                 }
             }
@@ -430,15 +435,30 @@ public final class TileCatalogProvider extends ContentProvider {
     private static void putCatalogRow(Map<String, JSONObject> byKey, Set<String> coveredPackages,
                                       Set<String> coveredSystemTitles, String key, String pkg,
                                       String cls, String title, String kind, String modId) throws Exception {
+        putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
+                key, pkg, cls, title, kind, modId, "", "", "", 0);
+    }
+
+    private static void putCatalogRow(Map<String, JSONObject> byKey, Set<String> coveredPackages,
+                                      Set<String> coveredSystemTitles, String key, String pkg,
+                                      String cls, String title, String kind, String modId,
+                                      String iconPkg, String iconType, String iconName, int iconId) throws Exception {
         if (key == null || key.isEmpty() || byKey.containsKey(key)) return;
+        JSONObject priorWildcard = null;
         if (!pkg.isEmpty()) {
             String wildcard = pkg + "/*";
             if (!key.equals(wildcard) && byKey.containsKey(wildcard)) {
-                byKey.remove(wildcard);
+                priorWildcard = byKey.remove(wildcard);
             } else if (key.equals(wildcard) && coveredPackages.contains(pkg)) {
                 return;
             }
             coveredPackages.add(pkg);
+        }
+        if (priorWildcard != null && (iconName == null || iconName.isEmpty()) && iconId == 0) {
+            iconPkg = clean(priorWildcard.optString("iconPkg", ""));
+            iconType = clean(priorWildcard.optString("iconType", ""));
+            iconName = clean(priorWildcard.optString("iconName", ""));
+            iconId = priorWildcard.optInt("iconId", 0);
         }
         JSONObject row = new JSONObject();
         row.put("key", key);
@@ -447,6 +467,10 @@ public final class TileCatalogProvider extends ContentProvider {
         row.put("title", title);
         row.put("kind", kind);
         if (modId != null) row.put("mod", modId);
+        if (iconPkg != null && !iconPkg.isEmpty()) row.put("iconPkg", iconPkg);
+        if (iconType != null && !iconType.isEmpty()) row.put("iconType", iconType);
+        if (iconName != null && !iconName.isEmpty()) row.put("iconName", iconName);
+        if (iconId != 0) row.put("iconId", iconId);
         byKey.put(key, row);
         if ("system".equals(kind) && title != null && !title.isEmpty()) {
             coveredSystemTitles.add(title.toLowerCase(Locale.US));

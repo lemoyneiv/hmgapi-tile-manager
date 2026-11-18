@@ -177,11 +177,11 @@ public final class MainActivity extends Activity {
         int pad = d(14);
         rail.setPadding(pad, d(13), pad, d(13));
 
-        // 1. Brand row
+        // 1. Brand row + author credit
         LinearLayout brand = new LinearLayout(this);
         brand.setOrientation(LinearLayout.HORIZONTAL);
         brand.setGravity(Gravity.CENTER_VERTICAL);
-        brand.addView(TileWidgets.iconBadge(this, TileIcons.GRID_ALL, PRIMARY_CONT, ON_PRIMARY_CONT, 40, 21));
+        brand.addView(TileWidgets.iconBadge(this, TileIcons.GRID_ALL, PRIMARY_CONT, ON_PRIMARY_CONT, 44, 22));
 
         LinearLayout brandText = new LinearLayout(this);
         brandText.setOrientation(LinearLayout.VERTICAL);
@@ -196,12 +196,22 @@ public final class MainActivity extends Activity {
         title.setSingleLine(true);
         brandText.addView(title);
 
+        TextView lblAuthor = new TextView(this);
+        lblAuthor.setText("by lemoyneiv");
+        lblAuthor.setTextColor(ON_SURFACE_VAR);
+        lblAuthor.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        lblAuthor.setSingleLine(true);
+        brandText.addView(lblAuthor);
+
         lblConnSub = new TextView(this);
         lblConnSub.setText("Checking HMG-API…");
         lblConnSub.setTextColor(ON_SURFACE_VAR);
-        lblConnSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        lblConnSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         lblConnSub.setSingleLine(true);
-        brandText.addView(lblConnSub);
+        LinearLayout.LayoutParams csp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        csp.topMargin = d(1);
+        brandText.addView(lblConnSub, csp);
 
         brand.addView(brandText, btp);
         rail.addView(brand);
@@ -571,7 +581,13 @@ public final class MainActivity extends Activity {
                         if (title.isEmpty()) title = resolveFallbackTitle(pkg, cls);
                         String kind = "package".equals(row.optString("kind", "")) ? "package" : "system";
                         String mod = row.has("mod") ? row.optString("mod", null) : null;
-                        items.add(new TileWidgets.TileItem(key, pkg, cls, title, kind, mod, false));
+                        String iconPkg = row.optString("iconPkg", "").trim();
+                        String iconType = row.optString("iconType", "").trim();
+                        String iconName = row.optString("iconName", "").trim();
+                        int iconId = row.optInt("iconId", 0);
+                        items.add(new TileWidgets.TileItem(
+                                key, pkg, cls, title, kind, mod, false,
+                                iconPkg, iconType, iconName, iconId));
                     }
                 }
             } catch (Throwable ignored) {}
@@ -771,13 +787,13 @@ public final class MainActivity extends Activity {
 
     private void updateRailHeader() {
         if (hookOutdated) {
-            lblConnSub.setText("● Reboot Required · v1.0.3");
+            lblConnSub.setText("● Reboot Required · v1.0.4");
             lblConnSub.setTextColor(WARN);
         } else if (hmgApiConnected) {
-            lblConnSub.setText("● HMG-API Live · v1.0.3");
+            lblConnSub.setText("● HMG-API Live · v1.0.4");
             lblConnSub.setTextColor(OK);
         } else {
-            lblConnSub.setText("● Local Mode · v1.0.3");
+            lblConnSub.setText("● Local Mode · v1.0.4");
             lblConnSub.setTextColor(ON_SURFACE_VAR);
         }
     }
