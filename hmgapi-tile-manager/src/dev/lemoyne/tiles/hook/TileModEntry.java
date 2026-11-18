@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *  - com.android.launcher3: inspects all menu entries (7-arg + overloaded constructors), wraps
  *    launcher.menu_list.items in FilterableMenuList so mod/custom tiles added later by HMG-API's
  *    LIFO afterHookedMethod or NEMESIS are captured and filtered, excludes unequipped trim/region
- *    ghost stock tiles via PackageManager + Gen5wFacts + all_menu, pushes the schema-3 catalog to
+ *    ghost stock tiles via PackageManager + Gen5wFacts + all_menu, pushes the schema-4 catalog to
  *    TileCatalogProvider, and synchronises all_menu with exact itemId/slot backup & gap compaction.
  *  - com.hkmc.system.app.homesetting: wraps homesetting.edit_list.items in FilterableMenuList so
  *    both stock and mod/custom hidden tiles stay hidden in Edit Home Icons and update live.
@@ -140,7 +140,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("launcher tile manager v1.0.2 active in " + app.processName);
+        mod.log("launcher tile manager v1.0.3 active in " + app.processName);
     }
 
     private void hookEditor(final ModContext mod, final LoadedApp app) {
@@ -175,7 +175,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("menu editor tile manager v1.0.2 active in " + app.processName);
+        mod.log("menu editor tile manager v1.0.3 active in " + app.processName);
     }
 
     private static void hookEntryCtor(final ModContext mod, ClassLoader cl, String pointId,
@@ -524,28 +524,33 @@ public final class TileModEntry extends ModEntry {
                                            TileStore.MenuInventory inv, TileStore.Config cfg) {
         Map<String, Map<String, Object>> catalogByKey = new LinkedHashMap<String, Map<String, Object>>();
         Set<String> coveredPackages = new LinkedHashSet<String>();
+        Set<Integer> coveredItemIds = new LinkedHashSet<Integer>();
+        Set<String> coveredSystemTitles = new LinkedHashSet<String>();
         Set<String> matchedKeys = new LinkedHashSet<String>();
         Set<String> rejectedKeys = new LinkedHashSet<String>();
+        Set<String> rejectedSinglePkgs = new LinkedHashSet<String>();
         preSeedMatchedKeys(rawItems, matchedKeys);
 
-        List<Object> extractedItems = new ArrayList<Object>();
         List<EntryMeta> extractedMetas = new ArrayList<EntryMeta>();
+        List<Object> deferredItems = new ArrayList<Object>();
         Map<String, Set<String>> keysByPkg = new LinkedHashMap<String, Set<String>>();
         if (rawItems != null) {
             for (Object item : rawItems) {
                 EntryMeta m = ensureMeta(ctx, item, launcherInspector, inv, matchedKeys, null);
+                if (m == null || m.key.isEmpty()) {
+                    deferredItems.add(item);
+                    continue;
+                }
+                matchedKeys.add(m.key);
+                extractedMetas.add(m);
+                recordPkgKey(keysByPkg, m);
+            }
+            for (Object item : deferredItems) {
+                EntryMeta m = ensureMeta(ctx, item, launcherInspector, inv, matchedKeys, null);
                 if (m == null || m.key.isEmpty()) continue;
                 matchedKeys.add(m.key);
-                extractedItems.add(item);
                 extractedMetas.add(m);
-                if (!m.pkg.isEmpty()) {
-                    Set<String> ks = keysByPkg.get(m.pkg);
-                    if (ks == null) {
-                        ks = new LinkedHashSet<String>();
-                        keysByPkg.put(m.pkg, ks);
-                    }
-                    ks.add(m.key);
-                }
+                recordPkgKey(keysByPkg, m);
             }
         }
 
@@ -557,20 +562,28 @@ public final class TileModEntry extends ModEntry {
 
         TileStore.Gen5wFacts facts = getGen5wFacts(ctx);
 
-        // 1. Entries from Launcher_WP3's menu list (stock 7-arg + overloaded ctors + HMG-API mods + NEMESIS)
+        // 1. Entries from Launcher_WP3's menu list (stock 7-arg + overloaded ctors + HMG-API mods + NEMESIS).
+        //    Note: never reject stock Q entries via isEnableMenu()/isAvailable()—greyed-out stock tiles
+        //    (e.g. Phone Projection without phone connected, Valet Mode, Quiet Mode, HD Radio Data)
+        //    remain on the Gen5W Home Screen and must stay visible & toggleable in Tile Manager.
         for (int i = 0; i < extractedMetas.size(); i++) {
-            Object item = extractedItems.get(i);
             EntryMeta m = extractedMetas.get(i);
             if ("system".equals(m.kind)) {
-                if (isEntryExplicitlyUnsupported(item)
-                        || !isTargetComponentInstalled(ctx, m.pkg, m.cls)
+                if (!isTargetComponentInstalled(ctx, m.pkg, m.cls)
                         || !TileStore.isSupportedStockFeature(m.title, m.pkg, m.cls, facts)
                         || !TileStore.isEquippedSystemTile(m.key, m.pkg, m.cls, inv, multiEntryPackages)) {
                     rejectedKeys.add(m.key);
+                    if (!m.pkg.isEmpty() && !multiEntryPackages.contains(m.pkg)) {
+                        rejectedSinglePkgs.add(m.pkg);
+                    }
                     continue;
                 }
             }
             putCatalogRow(catalogByKey, coveredPackages, m);
+            if (m.itemId > 0) coveredItemIds.add(Integer.valueOf(m.itemId));
+            if ("system".equals(m.kind) && !m.title.isEmpty()) {
+                coveredSystemTitles.add(m.title.toLowerCase(Locale.US));
+            }
         }
 
         // 2. HMG-API's own app + all enabled mods' provides.launcher entries (ensures 100% custom mod
@@ -588,12 +601,18 @@ public final class TileModEntry extends ModEntry {
             putCatalogRow(catalogByKey, coveredPackages, m);
         }
 
-        // 3. Custom/mod entries in all_menu (or bootstrap stock entries if Launcher_WP3 rawItems is empty)
+        // 3. Custom/mod entries in all_menu, backed-up hidden tiles, and stock bootstrap/fallback entries
         boolean hasLauncherItems = !extractedMetas.isEmpty();
+        boolean hasUnextractedLauncherItems = rawItems != null && extractedMetas.size() < rawItems.size();
         if (inv != null) {
             for (TileStore.MenuEntryRecord rec : inv.activeEntries) {
                 if (catalogByKey.containsKey(rec.key) || rejectedKeys.contains(rec.key)) continue;
+                if (!rec.packageName.isEmpty() && rejectedSinglePkgs.contains(rec.packageName)) continue;
                 if (!rec.packageName.isEmpty() && catalogByKey.containsKey(rec.packageName + "/*")) continue;
+                if (!rec.packageName.isEmpty() && !multiEntryPackages.contains(rec.packageName)
+                        && coveredPackages.contains(rec.packageName)) {
+                    continue;
+                }
                 if (("*".equals(rec.className) || rec.className.isEmpty())
                         && !rec.packageName.isEmpty() && coveredPackages.contains(rec.packageName)) {
                     continue;
@@ -601,9 +620,15 @@ public final class TileModEntry extends ModEntry {
                 EntryMeta m = buildMeta(ctx, rec.packageName, rec.className, 0, null, rec.itemId);
                 if (m.key.isEmpty() || catalogByKey.containsKey(m.key) || rejectedKeys.contains(m.key)) continue;
                 if ("system".equals(m.kind)) {
-                    // Launcher_WP3 drops any saved stock entry not in menu_list.items; never re-insert
-                    // skipped or unequipped stock items from all_menu.
-                    if (hasLauncherItems) continue;
+                    if (rec.itemId > 0 && coveredItemIds.contains(Integer.valueOf(rec.itemId))) continue;
+                    if (m.pkg.isEmpty() && !m.title.isEmpty()
+                            && coveredSystemTitles.contains(m.title.toLowerCase(Locale.US))) {
+                        continue;
+                    }
+                    boolean isBackedUp = inv.backedUpKeys.contains(rec.key)
+                            || inv.backedUpKeys.contains(m.key)
+                            || (!m.pkg.isEmpty() && inv.backedUpKeys.contains(m.pkg + "/*"));
+                    if (hasLauncherItems && !hasUnextractedLauncherItems && !isBackedUp) continue;
                     if (!isTargetComponentInstalled(ctx, m.pkg, m.cls)
                             || !TileStore.isSupportedStockFeature(m.title, m.pkg, m.cls, facts)
                             || !TileStore.isEquippedSystemTile(m.key, m.pkg, m.cls, inv, multiEntryPackages)) {
@@ -611,6 +636,10 @@ public final class TileModEntry extends ModEntry {
                     }
                 }
                 putCatalogRow(catalogByKey, coveredPackages, m);
+                if (rec.itemId > 0) coveredItemIds.add(Integer.valueOf(rec.itemId));
+                if ("system".equals(m.kind) && !m.title.isEmpty()) {
+                    coveredSystemTitles.add(m.title.toLowerCase(Locale.US));
+                }
             }
         }
 
@@ -619,6 +648,16 @@ public final class TileModEntry extends ModEntry {
         doc.put("schema", Long.valueOf(TileStore.CATALOG_SCHEMA));
         doc.put("tiles", new ArrayList<Object>(catalogByKey.values()));
         return TileStore.writeCompact(doc);
+    }
+
+    private static void recordPkgKey(Map<String, Set<String>> keysByPkg, EntryMeta m) {
+        if (m.pkg.isEmpty()) return;
+        Set<String> ks = keysByPkg.get(m.pkg);
+        if (ks == null) {
+            ks = new LinkedHashSet<String>();
+            keysByPkg.put(m.pkg, ks);
+        }
+        ks.add(m.key);
     }
 
     private static void putCatalogRow(Map<String, Map<String, Object>> catalogByKey,
@@ -689,26 +728,6 @@ public final class TileModEntry extends ModEntry {
         } catch (Throwable ignored) {
             return true;
         }
-    }
-
-    private static boolean isEntryExplicitlyUnsupported(Object item) {
-        if (item == null) return false;
-        String[] methods = new String[] { "isSupport", "isSupported", "isAvailable", "isEnableMenu" };
-        for (Class<?> cur = item.getClass(); cur != null && cur != Object.class; cur = cur.getSuperclass()) {
-            for (String name : methods) {
-                try {
-                    Method m = cur.getDeclaredMethod(name);
-                    if (Modifier.isStatic(m.getModifiers())) continue;
-                    Class<?> rt = m.getReturnType();
-                    if (rt != boolean.class && rt != Boolean.class) continue;
-                    m.setAccessible(true);
-                    Object v = m.invoke(item);
-                    if (Boolean.FALSE.equals(v)) return true;
-                } catch (NoSuchMethodException ignored) {
-                } catch (Throwable ignored) {}
-            }
-        }
-        return false;
     }
 
     private static TileStore.Gen5wFacts getGen5wFacts(Context ctx) {
@@ -959,6 +978,13 @@ public final class TileModEntry extends ModEntry {
                                 TileStore.Config fresh = effectiveConfig(mod, appCtx, overrideJson);
                                 lastAppliedSignature = fresh.signature(mod.enabled());
                                 syncSavedMenu(mod, appCtx, fresh, installedCatalogKeys(appCtx));
+                                List<Object> raw = snapshotLauncherRawItems();
+                                TileStore.MenuInventory inv = readMenuInventory(appCtx);
+                                String freshCat = buildCatalogJson(appCtx, raw, inv, fresh);
+                                if (freshCat != null) {
+                                    lastCatalogJson = freshCat;
+                                    pushCatalogSync(appCtx, freshCat);
+                                }
                             } catch (Throwable t) {
                                 mod.error("launcher live tile sync", t);
                             } finally {
@@ -1015,9 +1041,7 @@ public final class TileModEntry extends ModEntry {
         if (ctx == null) {
             return TileStore.collectMenuInventory(Collections.<String>emptyList(), null);
         }
-        List<String> driver1Jsons = new ArrayList<String>();
-        List<String> nonGuestJsons = new ArrayList<String>();
-        List<String> allJsons = new ArrayList<String>();
+        Map<String, String> menusByUser = new LinkedHashMap<String, String>();
         Map<String, Object> backups = readBackupsMap(ctx);
         Cursor cur = null;
         try {
@@ -1025,26 +1049,21 @@ public final class TileModEntry extends ModEntry {
             if (cur != null) {
                 int userCol = cur.getColumnIndex("userName");
                 int itemsCol = cur.getColumnIndex("menu_items");
+                int idx = 0;
                 while (cur.moveToNext()) {
                     String user = userCol >= 0 ? TileStore.cleanToken(cur.getString(userCol)) : "";
                     String json = itemsCol >= 0 ? cur.getString(itemsCol) : null;
                     if (json == null || json.isEmpty()) continue;
-                    allJsons.add(json);
-                    if ("Driver 1".equalsIgnoreCase(user)) {
-                        driver1Jsons.add(json);
-                    }
-                    if (!"Guest".equalsIgnoreCase(user)) {
-                        nonGuestJsons.add(json);
-                    }
+                    String mapKey = (user.isEmpty() || menusByUser.containsKey(user))
+                            ? ("#" + (idx++)) : user;
+                    menusByUser.put(mapKey, json);
                 }
             }
         } catch (Throwable ignored) {
         } finally {
             if (cur != null) cur.close();
         }
-        List<String> chosen = !driver1Jsons.isEmpty() ? driver1Jsons
-                : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons);
-        return TileStore.collectMenuInventory(chosen, backups);
+        return TileStore.collectMenuInventory(TileStore.selectProfileMenuJsons(menusByUser), backups);
     }
 
     private static Map<String, Object> readBackupsMap(Context ctx) {

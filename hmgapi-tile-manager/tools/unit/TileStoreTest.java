@@ -399,6 +399,71 @@ public final class TileStoreTest {
                 TileStore.isEquippedSystemTile("com.hkmc.radio/com.hkmc.radio.RadioActivity",
                         "com.hkmc.radio", "com.hkmc.radio.RadioActivity", pkgOnlySettingsInv, multiPkgs));
 
+        // 16. v1.0.3 regressions: schema-4 parity, wildcard backup/equip/restore, EntryInspector
+        //     wildcard-matched itemId disambiguation, and renamed owner profile selection
+        check("TileStore.CATALOG_SCHEMA is 4", Integer.valueOf(4), Integer.valueOf(TileStore.CATALOG_SCHEMA));
+
+        Map<String, Object> qrBackups = new LinkedHashMap<String, Object>();
+        TileStore.Config hideQrManual = new TileStore.Config(true, true, setOf("com.hkmc.qrmanual/*"));
+        TileStore.SyncResult rHideQr = TileStore.syncProfileMenu("Driver 1", i5Menu, hideQrManual, null, qrBackups);
+        checkTrue("hiding pkg/* stock tile updates menu", rHideQr.updatedMenuJson != null);
+        TileStore.MenuInventory qrHiddenInv = TileStore.collectMenuInventory(
+                Collections.singletonList(rHideQr.updatedMenuJson), qrBackups);
+        checkTrue("backedUpKeys retains hidden pkg/* key", qrHiddenInv.backedUpKeys.contains("com.hkmc.qrmanual/*"));
+        checkTrue("hidden pkg/* tile stays equipped when Q reports full pkg/cls",
+                TileStore.isEquippedSystemTile("com.hkmc.qrmanual/com.hkmc.qrmanual.QRManualActivity",
+                        "com.hkmc.qrmanual", "com.hkmc.qrmanual.QRManualActivity", qrHiddenInv, multiPkgs));
+        check("hidden pkg/* matches full pkg/cls Q entry", "com.hkmc.qrmanual/*",
+                TileStore.matchingHiddenKey(hideQrManual.hidden,
+                        "com.hkmc.qrmanual", "com.hkmc.qrmanual.QRManualActivity", 15));
+        TileStore.SyncResult rShowQr = TileStore.syncProfileMenu("Driver 1", rHideQr.updatedMenuJson, showAll, null, qrBackups);
+        check("Show All restores User's Manual into first free slot (slot 7)", "com.hkmc.qrmanual", slotPkg(rShowQr.updatedMenuJson, 7));
+        check("Show All preserves User's Manual itemId 15", Integer.valueOf(15), Integer.valueOf(slotItemId(rShowQr.updatedMenuJson, 7)));
+
+        // EntryInspector Step 4: zMode=2 must NOT collide with ALL_MENU itemId 2 (com.mnsoft.navi/*)
+        // once full-class com.mnsoft.navi/com.mnsoft.navi.NaviMenuActivity is already matched!
+        TileStore.IntStringProbe radioProbe = new TileStore.IntStringProbe() {
+            @Override
+            public String resolveStringResource(int resId) {
+                if (resId == 0x7f080024) return "Radio";
+                return mockRes.resolveStringResource(resId);
+            }
+        };
+        MockQ radioById = MockQ.ctorItemIdOnly(2, 8, 0x7f080024);
+        Set<String> matchedFullClass = setOf("com.mnsoft.navi/com.mnsoft.navi.NaviMenuActivity");
+        TileStore.EntryInspector.Extracted exRadio = inspector.extract(radioById, i5Inv, matchedFullClass, radioProbe);
+        check("itemId-only Q entry ignores already-matched pkg/* collision on zMode=2",
+                Integer.valueOf(8), Integer.valueOf(exRadio.matchedItemId));
+        check("itemId-only Q entry resolves Radio virtual class", "Radio", exRadio.cls);
+        check("itemId-only Q entry preserves calibrated titleId", Integer.valueOf(0x7f080024), Integer.valueOf(exRadio.titleId));
+
+        // Renamed Bluelink/Kia Connect profile ("Alex") is preferred over unpruned factory Driver 2 / Guest rows
+        String unprunedFactoryProfile = "{\"menuItems\":[{\"packageName\":\"com.naver.vibe\",\"itemId\":31,\"className\":\".MainActivity\"}]}";
+        Map<String, String> renamedProfiles = new LinkedHashMap<String, String>();
+        renamedProfiles.put("Alex", i5Menu);
+        renamedProfiles.put("Driver 2", unprunedFactoryProfile);
+        renamedProfiles.put("Guest", unprunedFactoryProfile);
+        List<String> selectedRenamed = TileStore.selectProfileMenuJsons(renamedProfiles);
+        check("renamed owner profile selects only Alex (omits factory Driver 2/Guest)",
+                Integer.valueOf(1), Integer.valueOf(selectedRenamed.size()));
+        check("renamed owner profile returns Alex menu JSON", i5Menu, selectedRenamed.get(0));
+
+        Map<String, String> defaultProfiles = new LinkedHashMap<String, String>();
+        defaultProfiles.put("Driver 1", i5Menu);
+        defaultProfiles.put("Driver 2", unprunedFactoryProfile);
+        defaultProfiles.put("Guest", unprunedFactoryProfile);
+        List<String> selectedDefault = TileStore.selectProfileMenuJsons(defaultProfiles);
+        check("default profiles select only Driver 1", Integer.valueOf(1), Integer.valueOf(selectedDefault.size()));
+        check("default profiles return Driver 1 menu JSON", i5Menu, selectedDefault.get(0));
+
+        Map<String, String> twoCustomProfiles = new LinkedHashMap<String, String>();
+        twoCustomProfiles.put("Alex", i5Menu);
+        twoCustomProfiles.put("Sam", sampleGrid());
+        twoCustomProfiles.put("Guest", unprunedFactoryProfile);
+        List<String> selectedTwoCustom = TileStore.selectProfileMenuJsons(twoCustomProfiles);
+        check("two custom driver profiles keep both while omitting Guest",
+                Integer.valueOf(2), Integer.valueOf(selectedTwoCustom.size()));
+
         System.out.println("TileStoreTest: " + checks + " checks passed");
     }
 
@@ -413,6 +478,7 @@ public final class TileStoreTest {
         private int eTitleId;
         private String fCachedLabel;
         private int gBadge;
+        private int hItemId;
 
         static MockQ ctor7(String pkg, String cls, int icon, int iconDis, int titleId, String label) {
             MockQ q = new MockQ();
@@ -452,6 +518,16 @@ public final class TileStoreTest {
             q.bCls = cls;
             q.eTitleId = 0;
             q.fCachedLabel = customLabel;
+            return q;
+        }
+
+        static MockQ ctorItemIdOnly(int zModeFlag, int itemId, int titleId) {
+            MockQ q = new MockQ();
+            q.zMode = zModeFlag;
+            q.aPkg = "";
+            q.bCls = "";
+            q.eTitleId = titleId;
+            q.hItemId = itemId;
             return q;
         }
     }

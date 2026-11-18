@@ -26,6 +26,11 @@ has "apk contains TileTheme" "Ldev/lemoyne/tiles/TileTheme;" "$APK_STRINGS"
 has "apk contains TileIcons" "Ldev/lemoyne/tiles/TileIcons;" "$APK_STRINGS"
 has "apk contains TileWidgets" "Ldev/lemoyne/tiles/TileWidgets;" "$APK_STRINGS"
 has "apk bundles HmgApi client" "Lhmgapi/client/HmgApi;" "$APK_STRINGS"
+has "apk contains refreshCatalog" "refreshCatalog" "$APK_STRINGS"
+
+HOOK_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/src/dev/lemoyne/tiles/hook/TileStore.java" | head -n 1)
+APP_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/app/java/dev/lemoyne/tiles/TileCatalogProvider.java" | head -n 1)
+check "hook and provider CATALOG_SCHEMA match" "$HOOK_SCHEMA" "$APP_SCHEMA"
 
 for ic in icon.png icon_night.png icon_disabled.png icon_disabled_night.png; do
     check "launcher tile $ic exists" yes "$(test -f "$M/icons/$ic" && echo yes || echo no)"

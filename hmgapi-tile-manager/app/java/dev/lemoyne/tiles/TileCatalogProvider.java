@@ -35,11 +35,11 @@ import java.util.Set;
 /**
  * Lightweight IPC ContentProvider bridging com.android.launcher3, com.hkmc.system.app.homesetting,
  * and the Tile Manager UI on stock Open-HMG/HMG-API without requiring any core daemon changes:
- *  - putCatalog / getCatalog: live schema-3 catalog of equipped stock + custom/mod launcher tiles
+ *  - putCatalog / getCatalog / refreshCatalog: live schema-4 catalog of equipped stock + custom/mod tiles
  *  - getConfig / putConfig: instant cross-process tile visibility & gap-compaction settings
  */
 public final class TileCatalogProvider extends ContentProvider {
-    static final int CATALOG_SCHEMA = 3;
+    static final int CATALOG_SCHEMA = 4;
     static final String AUTHORITY = "dev.lemoyne.tiles.provider";
     static final Uri URI = Uri.parse("content://" + AUTHORITY);
     static final Uri ALL_MENU = Uri.parse("content://com.hkmc.system.app.homesetting.provider/all_menu");
@@ -107,6 +107,14 @@ public final class TileCatalogProvider extends ContentProvider {
             return out;
         }
 
+        if ("refreshCatalog".equals(method)) {
+            if (!isAllowedCatalogSender(ctx, Binder.getCallingUid())) return null;
+            String json = refreshCatalogJson(ctx);
+            Bundle out = new Bundle();
+            if (json != null) out.putString("catalog_json", json);
+            return out;
+        }
+
         if ("getConfig".equals(method)) {
             String json = readEffectiveConfigJson(ctx);
             Bundle out = new Bundle();
@@ -143,7 +151,8 @@ public final class TileCatalogProvider extends ContentProvider {
                     if (doc.optInt("schema", 1) >= CATALOG_SCHEMA) {
                         return raw;
                     }
-                    // Stale schema < 3 catalog on disk: heal classifications & ghost entries immediately
+                    // Stale schema < 4 catalog on disk: heal classifications, missing ALL_MENU
+                    // entries & ghost entries immediately
                     JSONObject upgraded = enrichBootstrapCatalog(ctx, doc, true);
                     if (upgraded != null) {
                         writeAtomic(f, upgraded.toString());
@@ -157,16 +166,51 @@ public final class TileCatalogProvider extends ContentProvider {
         }
     }
 
+    /**
+     * Reconciles the cached catalog against live ALL_MENU + enabled HMG-API mods even when
+     * com.android.launcher3 is stopped in the background (e.g. immediately after Show All).
+     */
+    static String refreshCatalogJson(Context ctx) {
+        synchronized (LOCK) {
+            File f = new File(ctx.getFilesDir(), CATALOG_FILE);
+            JSONObject existingDoc = null;
+            String existingRaw = null;
+            boolean markOutdated = false;
+            if (f.isFile()) {
+                try {
+                    existingRaw = readUtf8(f);
+                    existingDoc = new JSONObject(existingRaw);
+                    markOutdated = existingDoc.optInt("schema", 1) < CATALOG_SCHEMA
+                            || existingDoc.optBoolean("hook_outdated", false);
+                } catch (Throwable ignored) {
+                    existingDoc = null;
+                }
+            }
+            JSONObject refreshed = enrichBootstrapCatalog(ctx, existingDoc, markOutdated);
+            if (refreshed != null) {
+                String out = refreshed.toString();
+                try {
+                    writeAtomic(f, out);
+                } catch (Throwable ignored) {}
+                return out;
+            }
+            return existingRaw;
+        }
+    }
+
     private static JSONObject enrichBootstrapCatalog(Context ctx, JSONObject legacyDoc, boolean markOutdated) {
         try {
             Map<String, JSONObject> byKey = new LinkedHashMap<String, JSONObject>();
+            Set<String> coveredPackages = new LinkedHashSet<String>();
+            Set<String> coveredSystemTitles = new LinkedHashSet<String>();
             Set<String> activeMenuKeys = new LinkedHashSet<String>();
             Set<String> activeMenuPackages = new LinkedHashSet<String>();
             Map<String, JSONObject> menuRecords = new LinkedHashMap<String, JSONObject>();
             Map<String, String> modByPkg = readModPackagesMap();
 
-            // 1. Read ALL_MENU preferring Driver 1 (or non-Guest profiles) so unpruned factory
-            //    Guest/Driver 2 rows do not inject ghost tiles.
+            // 1. Read ALL_MENU preferring custom-renamed owner profiles, then Driver 1, then
+            //    non-Guest profiles so unpruned factory Guest/Driver 2 rows do not inject ghosts.
+            List<String> customNamedJsons = new ArrayList<String>();
             List<String> driver1Jsons = new ArrayList<String>();
             List<String> nonGuestJsons = new ArrayList<String>();
             List<String> allJsons = new ArrayList<String>();
@@ -181,11 +225,15 @@ public final class TileCatalogProvider extends ContentProvider {
                         String json = itemsCol >= 0 ? cur.getString(itemsCol) : null;
                         if (json == null || json.isEmpty()) continue;
                         allJsons.add(json);
-                        if ("Driver 1".equalsIgnoreCase(user)) {
+                        if ("Guest".equalsIgnoreCase(user)) continue;
+                        nonGuestJsons.add(json);
+                        if ("Driver 1".equalsIgnoreCase(user) || "User 1".equalsIgnoreCase(user)
+                                || "User1".equalsIgnoreCase(user)) {
                             driver1Jsons.add(json);
-                        }
-                        if (!"Guest".equalsIgnoreCase(user)) {
-                            nonGuestJsons.add(json);
+                        } else if (!user.isEmpty()
+                                && !"Driver 2".equalsIgnoreCase(user) && !"User 2".equalsIgnoreCase(user) && !"User2".equalsIgnoreCase(user)
+                                && !"Driver 3".equalsIgnoreCase(user) && !"User 3".equalsIgnoreCase(user) && !"User3".equalsIgnoreCase(user)) {
+                            customNamedJsons.add(json);
                         }
                     }
                 }
@@ -194,8 +242,9 @@ public final class TileCatalogProvider extends ContentProvider {
                 if (cur != null) cur.close();
             }
 
-            List<String> chosenJsons = !driver1Jsons.isEmpty() ? driver1Jsons
-                    : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons);
+            List<String> chosenJsons = !customNamedJsons.isEmpty() ? customNamedJsons
+                    : (!driver1Jsons.isEmpty() ? driver1Jsons
+                    : (!nonGuestJsons.isEmpty() ? nonGuestJsons : allJsons));
             for (String json : chosenJsons) {
                 try {
                     JSONObject root = new JSONObject(json);
@@ -218,8 +267,8 @@ public final class TileCatalogProvider extends ContentProvider {
                 } catch (Throwable ignored) {}
             }
 
-            // Read currently hidden keys so real hidden tiles backed up in launcher3's private
-            // filesDir stay visible during a pre-reboot legacy catalog upgrade
+            // Read currently hidden keys (matching exact, pkg/* wildcard, and empty-class forms)
+            // so real hidden tiles backed up in launcher3's private filesDir stay visible
             Set<String> hidden = new LinkedHashSet<String>();
             String cfgRaw = readEffectiveConfigJsonLocked(ctx);
             if (cfgRaw != null) {
@@ -238,7 +287,7 @@ public final class TileCatalogProvider extends ContentProvider {
             Set<String> multiEntryPackages = new LinkedHashSet<String>();
             multiEntryPackages.add("com.android.settings");
 
-            // 2. Reclassify & filter legacy tiles (healing v1.0.1's nonStockPkg & ghost entries immediately)
+            // 2. Reclassify & filter existing catalog tiles
             if (legacyDoc != null) {
                 JSONArray oldArr = legacyDoc.optJSONArray("tiles");
                 if (oldArr != null) {
@@ -275,35 +324,23 @@ public final class TileCatalogProvider extends ContentProvider {
                             if (!isTargetComponentInstalled(ctx, pkg, cls)) continue;
                             if (!isSupportedStockFeature(ctx, title, pkg, cls)) continue;
                             if (hasMenuFilter && !isEquippedInMenu(key, pkg, cls, activeMenuKeys,
-                                    activeMenuPackages, multiEntryPackages) && !hidden.contains(key)) {
+                                    activeMenuPackages, multiEntryPackages)
+                                    && !isKeyHidden(hidden, key, pkg, cls, -1)) {
                                 continue;
                             }
                         }
-                        JSONObject copy = new JSONObject();
-                        copy.put("key", key);
-                        copy.put("packageName", pkg);
-                        copy.put("className", cls);
-                        copy.put("title", "system".equals(kind) ? friendlyTitle(title, pkg, cls) : title);
-                        copy.put("kind", kind);
-                        if (modId != null) copy.put("mod", modId);
-                        byKey.put(key, copy);
+                        String finalTitle = "system".equals(kind) ? friendlyTitle(title, pkg, cls) : title;
+                        putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
+                                key, pkg, cls, finalTitle, kind, modId);
                     }
                 }
             }
 
             // 3. Discover HMG-API app + all enabled HMG-API mod launcher entries
             if (isPackageInstalled(ctx, "hmgapi.app")) {
-                String k = "hmgapi.app/hmgapi.app.MainActivity";
-                if (!byKey.containsKey(k)) {
-                    JSONObject r = new JSONObject();
-                    r.put("key", k);
-                    r.put("packageName", "hmgapi.app");
-                    r.put("className", "hmgapi.app.MainActivity");
-                    r.put("title", "HMG-API");
-                    r.put("kind", "package");
-                    r.put("mod", "hmgapi");
-                    byKey.put(k, r);
-                }
+                putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
+                        "hmgapi.app/hmgapi.app.MainActivity", "hmgapi.app",
+                        "hmgapi.app.MainActivity", "HMG-API", "package", "hmgapi");
             }
             if (PUBLIC_STATE.isFile() && PUBLIC_STATE.canRead()) {
                 try {
@@ -333,22 +370,16 @@ public final class TileCatalogProvider extends ContentProvider {
                                 if (key.isEmpty() || byKey.containsKey(key)) continue;
                                 String title = clean(lm.optString("title", ""));
                                 if (title.isEmpty()) title = resolveAppLabel(ctx, pkg, fullCls);
-                                JSONObject r = new JSONObject();
-                                r.put("key", key);
-                                r.put("packageName", pkg);
-                                r.put("className", fullCls);
-                                r.put("title", title);
-                                r.put("kind", "package");
-                                r.put("mod", modId);
-                                byKey.put(key, r);
+                                putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
+                                        key, pkg, fullCls, title, "package", modId);
                             }
                         }
                     }
                 } catch (Throwable ignored) {}
             }
 
-            // 4. Add remaining tiles from ALL_MENU (only custom packages if legacyDoc already supplied
-            //    Launcher_WP3's stock catalog; otherwise filter stock tiles strictly)
+            // 4. Add remaining equipped tiles from ALL_MENU (recovers stock apps restored via
+            //    Show All or missing from a pre-v1.0.3 catalog while deduplicating covered packages)
             for (Map.Entry<String, JSONObject> e : menuRecords.entrySet()) {
                 String key = e.getKey();
                 if (byKey.containsKey(key)) continue;
@@ -356,6 +387,13 @@ public final class TileCatalogProvider extends ContentProvider {
                 String pkg = clean(it.optString("packageName", ""));
                 String cls = clean(it.optString("className", ""));
                 int id = it.optInt("itemId", -1);
+                if (!pkg.isEmpty() && byKey.containsKey(pkg + "/*")) continue;
+                if (!pkg.isEmpty() && !multiEntryPackages.contains(pkg) && coveredPackages.contains(pkg)) {
+                    continue;
+                }
+                if ((cls.isEmpty() || "*".equals(cls)) && !pkg.isEmpty() && coveredPackages.contains(pkg)) {
+                    continue;
+                }
                 String label = resolveAppLabel(ctx, pkg, cls);
                 String modId = modByPkg.get(pkg);
                 if (modId == null) {
@@ -363,20 +401,17 @@ public final class TileCatalogProvider extends ContentProvider {
                     else if (isNemesisTile(pkg, label, id)) modId = "nemesis";
                 }
                 String kind = classifyKind(ctx, pkg, label, id, modId);
+                String finalTitle = "package".equals(kind) ? label : friendlyTitle(label, pkg, cls);
                 if ("system".equals(kind)) {
-                    if (legacyDoc != null) continue;
+                    if (pkg.isEmpty() && !finalTitle.isEmpty()
+                            && coveredSystemTitles.contains(finalTitle.toLowerCase(Locale.US))) {
+                        continue;
+                    }
                     if (!isTargetComponentInstalled(ctx, pkg, cls)) continue;
-                    String titleCandidate = friendlyTitle(label, pkg, cls);
-                    if (!isSupportedStockFeature(ctx, titleCandidate, pkg, cls)) continue;
+                    if (!isSupportedStockFeature(ctx, finalTitle, pkg, cls)) continue;
                 }
-                JSONObject r = new JSONObject();
-                r.put("key", key);
-                r.put("packageName", pkg);
-                r.put("className", cls);
-                r.put("title", "package".equals(kind) ? label : friendlyTitle(label, pkg, cls));
-                r.put("kind", kind);
-                if (modId != null) r.put("mod", modId);
-                byKey.put(key, r);
+                putCatalogRow(byKey, coveredPackages, coveredSystemTitles,
+                        key, pkg, cls, finalTitle, kind, modId);
             }
 
             if (byKey.isEmpty()) return null;
@@ -390,6 +425,50 @@ public final class TileCatalogProvider extends ContentProvider {
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    private static void putCatalogRow(Map<String, JSONObject> byKey, Set<String> coveredPackages,
+                                      Set<String> coveredSystemTitles, String key, String pkg,
+                                      String cls, String title, String kind, String modId) throws Exception {
+        if (key == null || key.isEmpty() || byKey.containsKey(key)) return;
+        if (!pkg.isEmpty()) {
+            String wildcard = pkg + "/*";
+            if (!key.equals(wildcard) && byKey.containsKey(wildcard)) {
+                byKey.remove(wildcard);
+            } else if (key.equals(wildcard) && coveredPackages.contains(pkg)) {
+                return;
+            }
+            coveredPackages.add(pkg);
+        }
+        JSONObject row = new JSONObject();
+        row.put("key", key);
+        row.put("packageName", pkg);
+        row.put("className", cls);
+        row.put("title", title);
+        row.put("kind", kind);
+        if (modId != null) row.put("mod", modId);
+        byKey.put(key, row);
+        if ("system".equals(kind) && title != null && !title.isEmpty()) {
+            coveredSystemTitles.add(title.toLowerCase(Locale.US));
+        }
+    }
+
+    private static boolean isKeyHidden(Set<String> hidden, String key, String pkg, String cls, int itemId) {
+        if (hidden == null || hidden.isEmpty()) return false;
+        if (key != null && !key.isEmpty() && hidden.contains(key)) return true;
+        String exact = normKey(pkg, cls, itemId);
+        if (!exact.isEmpty() && hidden.contains(exact)) return true;
+        if (pkg != null && !pkg.isEmpty()) {
+            if (hidden.contains(pkg + "/*")) return true;
+            if (cls == null || cls.isEmpty() || "*".equals(cls)) {
+                String prefix = pkg + "/";
+                for (String hk : hidden) {
+                    if (hk.startsWith(prefix)) return true;
+                }
+            }
+        }
+        if (itemId > 0 && itemId != 39 && hidden.contains("@item/" + itemId)) return true;
+        return false;
     }
 
     private static boolean isEquippedInMenu(String key, String pkg, String cls,
@@ -410,7 +489,7 @@ public final class TileCatalogProvider extends ContentProvider {
         return false;
     }
 
-    private static Map<String, String> readModPackagesMap() {
+    static Map<String, String> readModPackagesMap() {
         Map<String, String> out = new LinkedHashMap<String, String>();
         if (!PUBLIC_STATE.isFile() || !PUBLIC_STATE.canRead()) return out;
         try {
@@ -472,11 +551,11 @@ public final class TileCatalogProvider extends ContentProvider {
         String pkg = hiddenKey.substring(0, slash).trim();
         String cls = hiddenKey.substring(slash + 1).trim();
         if (pkg.isEmpty()) return false;
+        if (!isTargetComponentInstalled(ctx, pkg, cls)) return true;
         Map<String, String> mods = readModPackagesMap();
         if ("package".equals(classifyKind(ctx, pkg, "", -1, mods.get(pkg)))) {
             return false;
         }
-        if (!isTargetComponentInstalled(ctx, pkg, cls)) return true;
         String label = resolveAppLabel(ctx, pkg, cls);
         return !isSupportedStockFeature(ctx, label, pkg, cls);
     }
@@ -726,7 +805,7 @@ public final class TileCatalogProvider extends ContentProvider {
         return null;
     }
 
-    private static String resolveAppLabel(Context ctx, String pkg, String cls) {
+    static String resolveAppLabel(Context ctx, String pkg, String cls) {
         if (ctx != null && !pkg.isEmpty()) {
             PackageManager pm = ctx.getPackageManager();
             String fullCls = cls.startsWith(".") ? pkg + cls : cls;

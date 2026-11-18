@@ -26,7 +26,7 @@ import java.util.Set;
 public final class TileStore {
     private TileStore() {}
 
-    public static final int CATALOG_SCHEMA = 2;
+    public static final int CATALOG_SCHEMA = 4;
 
     public static final String ACTION_TILES_CHANGED = "dev.lemoyne.tiles.ACTION_TILES_CHANGED";
     public static final String ACTION_REQUEST_CATALOG = "dev.lemoyne.tiles.ACTION_REQUEST_CATALOG";
@@ -95,15 +95,25 @@ public final class TileStore {
         public final Set<String> equippedPackages;
         public final Map<String, String> classToPackage;
         public final Map<Integer, MenuEntryRecord> byItemId;
+        public final Set<String> backedUpKeys;
 
         public MenuInventory(List<MenuEntryRecord> activeEntries, Set<String> equippedKeys,
                              Set<String> equippedPackages, Map<String, String> classToPackage,
                              Map<Integer, MenuEntryRecord> byItemId) {
+            this(activeEntries, equippedKeys, equippedPackages, classToPackage, byItemId,
+                    Collections.<String>emptySet());
+        }
+
+        public MenuInventory(List<MenuEntryRecord> activeEntries, Set<String> equippedKeys,
+                             Set<String> equippedPackages, Map<String, String> classToPackage,
+                             Map<Integer, MenuEntryRecord> byItemId, Set<String> backedUpKeys) {
             this.activeEntries = Collections.unmodifiableList(activeEntries);
             this.equippedKeys = Collections.unmodifiableSet(equippedKeys);
             this.equippedPackages = Collections.unmodifiableSet(equippedPackages);
             this.classToPackage = Collections.unmodifiableMap(classToPackage);
             this.byItemId = Collections.unmodifiableMap(byItemId);
+            this.backedUpKeys = Collections.unmodifiableSet(
+                    backedUpKeys == null ? Collections.<String>emptySet() : new LinkedHashSet<String>(backedUpKeys));
         }
 
         public boolean hasAnyData() {
@@ -542,6 +552,7 @@ public final class TileStore {
 
             // 4. Fallback itemId correlation when an entry has no package/class strings on Q
             if (pkg.isEmpty() && cls.isEmpty() && inv != null && !inv.byItemId.isEmpty()) {
+                Set<Integer> seenIds = new LinkedHashSet<Integer>();
                 MenuEntryRecord uniqueMatch = null;
                 int matches = 0;
                 for (Field f : allFields) {
@@ -550,9 +561,9 @@ public final class TileStore {
                     Object val = readField(f, item);
                     if (!(val instanceof Number)) continue;
                     int n = ((Number) val).intValue();
-                    if (n <= 0 || n == 39 || n >= 9000) continue;
+                    if (n <= 0 || n == 39 || n >= 9000 || !seenIds.add(Integer.valueOf(n))) continue;
                     MenuEntryRecord rec = inv.byItemId.get(Integer.valueOf(n));
-                    if (rec != null && (alreadyMatchedKeys == null || !alreadyMatchedKeys.contains(rec.key))) {
+                    if (rec != null && !isRecordAlreadyMatched(rec, alreadyMatchedKeys)) {
                         uniqueMatch = rec;
                         matches++;
                     }
@@ -566,6 +577,25 @@ public final class TileStore {
 
             if (pkg.isEmpty() && cls.isEmpty() && matchedItemId <= 0) return null;
             return new Extracted(pkg, cls, titleId, titleText, matchedItemId);
+        }
+
+        private static boolean isRecordAlreadyMatched(MenuEntryRecord rec, Set<String> alreadyMatchedKeys) {
+            if (alreadyMatchedKeys == null || alreadyMatchedKeys.isEmpty()) return false;
+            if (alreadyMatchedKeys.contains(rec.key)) return true;
+            if (!rec.packageName.isEmpty()) {
+                if (alreadyMatchedKeys.contains(rec.packageName + "/*")) return true;
+                if ("com.android.settings".equals(rec.packageName)) {
+                    return (rec.className.isEmpty() || "*".equals(rec.className))
+                            && alreadyMatchedKeys.contains("com.android.settings/com.android.settings.Settings");
+                }
+                if (rec.className.isEmpty() || "*".equals(rec.className)) {
+                    String prefix = rec.packageName + "/";
+                    for (String k : alreadyMatchedKeys) {
+                        if (k.startsWith(prefix)) return true;
+                    }
+                }
+            }
+            return false;
         }
 
         private static List<Field> allInstanceFields(Class<?> c) {
@@ -897,6 +927,38 @@ public final class TileStore {
         return null;
     }
 
+    /**
+     * Selects active driver profile ALL_MENU JSONs while avoiding unpruned factory Guest/Driver 2
+     * rows: prefers custom-renamed owner profiles (e.g. Bluelink/Kia Connect profile names), then
+     * Driver 1, then non-Guest profiles, then all profiles.
+     */
+    public static List<String> selectProfileMenuJsons(Map<String, String> menusByUser) {
+        if (menusByUser == null || menusByUser.isEmpty()) return Collections.emptyList();
+        List<String> customNamed = new ArrayList<String>();
+        List<String> driver1 = new ArrayList<String>();
+        List<String> nonGuest = new ArrayList<String>();
+        List<String> all = new ArrayList<String>();
+        for (Map.Entry<String, String> e : menusByUser.entrySet()) {
+            String user = cleanToken(e.getKey());
+            String json = e.getValue();
+            if (json == null || json.trim().isEmpty()) continue;
+            all.add(json);
+            if ("Guest".equalsIgnoreCase(user)) continue;
+            nonGuest.add(json);
+            if ("Driver 1".equalsIgnoreCase(user) || "User 1".equalsIgnoreCase(user) || "User1".equalsIgnoreCase(user)) {
+                driver1.add(json);
+            } else if (!user.isEmpty() && !user.startsWith("#")
+                    && !"Driver 2".equalsIgnoreCase(user) && !"User 2".equalsIgnoreCase(user) && !"User2".equalsIgnoreCase(user)
+                    && !"Driver 3".equalsIgnoreCase(user) && !"User 3".equalsIgnoreCase(user) && !"User3".equalsIgnoreCase(user)) {
+                customNamed.add(json);
+            }
+        }
+        if (!customNamed.isEmpty()) return customNamed;
+        if (!driver1.isEmpty()) return driver1;
+        if (!nonGuest.isEmpty()) return nonGuest;
+        return all;
+    }
+
     @SuppressWarnings("unchecked")
     public static MenuInventory collectMenuInventory(List<String> profileMenuJsons, Map<String, Object> allBackups) {
         Map<String, MenuEntryRecord> byKey = new LinkedHashMap<String, MenuEntryRecord>();
@@ -904,6 +966,7 @@ public final class TileStore {
         Set<String> equippedPackages = new LinkedHashSet<String>();
         Map<String, String> classToPackage = new LinkedHashMap<String, String>();
         Map<Integer, MenuEntryRecord> byItemId = new LinkedHashMap<Integer, MenuEntryRecord>();
+        Set<String> backedUpKeys = new LinkedHashSet<String>();
 
         if (profileMenuJsons != null) {
             for (String menuJson : profileMenuJsons) {
@@ -928,9 +991,16 @@ public final class TileStore {
                     if (!(userMap instanceof Map)) continue;
                     for (Map.Entry<String, Object> be : ((Map<String, Object>) userMap).entrySet()) {
                         String bk = normKeyString(be.getKey());
-                        if (!bk.isEmpty()) equippedKeys.add(bk);
+                        if (!bk.isEmpty()) {
+                            equippedKeys.add(bk);
+                            backedUpKeys.add(bk);
+                        }
                         if (be.getValue() instanceof Map) {
-                            recordInventoryItem((Map<String, Object>) be.getValue(), byKey, equippedKeys,
+                            Map<String, Object> bm = (Map<String, Object>) be.getValue();
+                            String recKey = normKey(cleanToken(bm.get("packageName")),
+                                    cleanToken(bm.get("className")), intVal(bm.get("itemId"), -1));
+                            if (!recKey.isEmpty()) backedUpKeys.add(recKey);
+                            recordInventoryItem(bm, byKey, equippedKeys,
                                     equippedPackages, classToPackage, byItemId);
                         }
                     }
@@ -939,7 +1009,7 @@ public final class TileStore {
         }
 
         return new MenuInventory(new ArrayList<MenuEntryRecord>(byKey.values()),
-                equippedKeys, equippedPackages, classToPackage, byItemId);
+                equippedKeys, equippedPackages, classToPackage, byItemId, backedUpKeys);
     }
 
     private static void recordInventoryItem(Map<String, Object> it,

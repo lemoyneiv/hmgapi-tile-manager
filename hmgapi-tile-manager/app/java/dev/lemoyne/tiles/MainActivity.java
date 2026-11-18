@@ -411,7 +411,7 @@ public final class MainActivity extends Activity {
                     @Override
                     public void onClick(View v) {
                         requestLauncherCatalog();
-                        reloadFromDisk(false);
+                        reloadFromDisk(false, true);
                         showStatus("Refreshing catalog…");
                     }
                 });
@@ -479,7 +479,11 @@ public final class MainActivity extends Activity {
 
     // ---- Data Loading & Live Persistence ----
 
-    private void reloadFromDisk(final boolean askLauncherIfEmpty) {
+    private void reloadFromDisk(boolean askLauncherIfEmpty) {
+        reloadFromDisk(askLauncherIfEmpty, false);
+    }
+
+    private void reloadFromDisk(final boolean askLauncherIfEmpty, final boolean reconcileProvider) {
         io.execute(new Runnable() {
             @Override
             public void run() {
@@ -494,7 +498,9 @@ public final class MainActivity extends Activity {
                 }
 
                 final String cfgJson = TileCatalogProvider.readEffectiveConfigJson(MainActivity.this);
-                final String catJson = TileCatalogProvider.readCatalogJson(MainActivity.this);
+                final String catJson = reconcileProvider
+                        ? TileCatalogProvider.refreshCatalogJson(MainActivity.this)
+                        : TileCatalogProvider.readCatalogJson(MainActivity.this);
                 final JSONObject finalDaemon = daemonSettings;
 
                 ui.post(new Runnable() {
@@ -562,7 +568,7 @@ public final class MainActivity extends Activity {
                         if (key.isEmpty() || seenKeys.contains(key)) continue;
                         seenKeys.add(key);
                         String title = row.optString("title", "").trim();
-                        if (title.isEmpty()) title = fallbackTitle(pkg, cls);
+                        if (title.isEmpty()) title = resolveFallbackTitle(pkg, cls);
                         String kind = "package".equals(row.optString("kind", "")) ? "package" : "system";
                         String mod = row.has("mod") ? row.optString("mod", null) : null;
                         items.add(new TileWidgets.TileItem(key, pkg, cls, title, kind, mod, false));
@@ -571,38 +577,41 @@ public final class MainActivity extends Activity {
             } catch (Throwable ignored) {}
         }
 
-        // Only synthesize fallback cards from loadedHidden if catalog has not been populated yet;
-        // when the catalog is present, it already includes all equipped & backed-up hidden tiles,
-        // so skipping unmatched keys prevents stale ghost entries from reappearing as orphan cards.
-        if (items.isEmpty()) {
-            for (String hk : loadedHidden) {
-                if (seenKeys.contains(hk) || matchesExistingCatalogItem(items, hk)) continue;
-                int slash = hk.indexOf('/');
-                if (slash <= 0) continue;
-                String left = hk.substring(0, slash);
-                String right = hk.substring(slash + 1);
-                String pkg;
-                String cls;
-                String title;
-                String kind;
-                if ("@class".equals(left)) {
-                    pkg = "";
-                    cls = right;
-                    title = fallbackTitle("", cls);
-                    kind = "system";
-                } else if ("@item".equals(left)) {
-                    pkg = "";
-                    cls = "";
-                    title = "Saved Tile #" + right;
-                    kind = "system";
-                } else {
-                    pkg = left;
-                    cls = right;
-                    title = fallbackTitle(pkg, cls);
-                    kind = TileCatalogProvider.classifyKind(this, pkg, title, -1, null);
-                }
-                items.add(new TileWidgets.TileItem(hk, pkg, cls, title, kind, null, true));
+        // Ensure every non-ghost hidden tile stays visible & toggleable in Tile Manager even if
+        // launcher3 has not restarted yet or a catalog snapshot omitted the entry.
+        Map<String, String> modByPkg = null;
+        for (String hk : loadedHidden) {
+            if (seenKeys.contains(hk) || matchesExistingCatalogItem(items, hk)) continue;
+            if (!items.isEmpty() && TileCatalogProvider.isGhostSystemKey(this, hk)) continue;
+            int slash = hk.indexOf('/');
+            if (slash <= 0) continue;
+            String left = hk.substring(0, slash);
+            String right = hk.substring(slash + 1);
+            String pkg;
+            String cls;
+            String title;
+            String kind;
+            String modId = null;
+            if ("@class".equals(left)) {
+                pkg = "";
+                cls = right;
+                title = resolveFallbackTitle("", cls);
+                kind = "system";
+            } else if ("@item".equals(left)) {
+                pkg = "";
+                cls = "";
+                title = "Saved Tile #" + right;
+                kind = "system";
+            } else {
+                pkg = left;
+                cls = right;
+                if (modByPkg == null) modByPkg = TileCatalogProvider.readModPackagesMap();
+                modId = modByPkg.get(pkg);
+                title = resolveFallbackTitle(pkg, cls);
+                kind = TileCatalogProvider.classifyKind(this, pkg, title, -1, modId);
             }
+            seenKeys.add(hk);
+            items.add(new TileWidgets.TileItem(hk, pkg, cls, title, kind, modId, true));
         }
 
         Collections.sort(items, new Comparator<TileWidgets.TileItem>() {
@@ -762,13 +771,13 @@ public final class MainActivity extends Activity {
 
     private void updateRailHeader() {
         if (hookOutdated) {
-            lblConnSub.setText("● Reboot Required · v1.0.2");
+            lblConnSub.setText("● Reboot Required · v1.0.3");
             lblConnSub.setTextColor(WARN);
         } else if (hmgApiConnected) {
-            lblConnSub.setText("● HMG-API Live · v1.0.2");
+            lblConnSub.setText("● HMG-API Live · v1.0.3");
             lblConnSub.setTextColor(OK);
         } else {
-            lblConnSub.setText("● Local Mode · v1.0.2");
+            lblConnSub.setText("● Local Mode · v1.0.3");
             lblConnSub.setTextColor(ON_SURFACE_VAR);
         }
     }
@@ -782,7 +791,7 @@ public final class MainActivity extends Activity {
             else totalSys++;
             if (isItemHidden(it)) hiddenInCatalog++;
         }
-        int totalHidden = totalAll > 0 ? hiddenInCatalog : hiddenKeys.size();
+        int totalHidden = Math.max(hiddenInCatalog, hiddenKeys.size());
         if (totalAll > 0) {
             int vis = Math.max(0, totalAll - hiddenInCatalog);
             lblHeroCount.setText(vis + " / " + totalAll + " Visible");
@@ -986,7 +995,7 @@ public final class MainActivity extends Activity {
                         @Override
                         public void onClick(View v) {
                             requestLauncherCatalog();
-                            reloadFromDisk(false);
+                            reloadFromDisk(false, true);
                             showStatus("Requested catalog from launcher…");
                         }
                     });
@@ -1000,15 +1009,17 @@ public final class MainActivity extends Activity {
 
     // ---- Helpers ----
 
-    private static String fallbackTitle(String pkg, String cls) {
-        String friendly = TileCatalogProvider.friendlyTitle("", pkg, cls);
+    private String resolveFallbackTitle(String pkg, String cls) {
+        String resolved = pkg != null && !pkg.isEmpty()
+                ? TileCatalogProvider.resolveAppLabel(this, pkg, cls == null ? "" : cls) : "";
+        String friendly = TileCatalogProvider.friendlyTitle(resolved, pkg == null ? "" : pkg, cls == null ? "" : cls);
         if (!friendly.equals(pkg) && !"Home Tile".equals(friendly)) return friendly;
         if (cls != null && !cls.isEmpty() && !"*".equals(cls)) {
             int dot = cls.lastIndexOf('.');
             if (dot >= 0 && dot + 1 < cls.length()) return cls.substring(dot + 1);
             return cls;
         }
-        return !pkg.isEmpty() ? pkg : friendly;
+        return pkg != null && !pkg.isEmpty() ? pkg : friendly;
     }
 
     private static String joinKeys(Set<String> keys) {
