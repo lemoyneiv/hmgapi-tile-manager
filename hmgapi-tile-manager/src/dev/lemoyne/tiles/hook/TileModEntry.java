@@ -1,5 +1,7 @@
 package dev.lemoyne.tiles.hook;
 
+import android.app.Activity;
+import android.app.Application;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.ContentResolver;
@@ -15,6 +17,8 @@ import android.content.res.Resources;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 
 import hmgapi.hook.LoadedApp;
 import hmgapi.hook.MethodHook;
@@ -23,10 +27,12 @@ import hmgapi.hook.ModEntry;
 import hmgapi.hook.Points;
 
 import java.io.File;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -70,9 +76,11 @@ public final class TileModEntry extends ModEntry {
         final String iconType;
         final String iconName;
         final int iconId;
+        final boolean hmgSynthetic;
 
         EntryMeta(String key, String pkg, String cls, String title, String kind, String modId,
-                  int itemId, String iconPkg, String iconType, String iconName, int iconId) {
+                  int itemId, String iconPkg, String iconType, String iconName, int iconId,
+                  boolean hmgSynthetic) {
             this.key = key;
             this.pkg = pkg;
             this.cls = cls;
@@ -84,6 +92,7 @@ public final class TileModEntry extends ModEntry {
             this.iconType = iconType == null ? "" : iconType;
             this.iconName = iconName == null ? "" : iconName;
             this.iconId = iconId;
+            this.hmgSynthetic = hmgSynthetic;
         }
     }
 
@@ -94,6 +103,7 @@ public final class TileModEntry extends ModEntry {
 
     private static final Object SYNC_LOCK = new Object();
     private static final AtomicBoolean launcherReloadPending = new AtomicBoolean(false);
+    private static final AtomicBoolean launcherLifecycleStarted = new AtomicBoolean(false);
     private static final AtomicInteger postLoadSeq = new AtomicInteger(0);
 
     private static volatile boolean launcherReceiverStarted;
@@ -102,10 +112,14 @@ public final class TileModEntry extends ModEntry {
     private static volatile String lastAppliedSignature;
     private static volatile TileStore.Gen5wFacts cachedFacts;
 
+    private static volatile ClassLoader launcherLoader;
+    private static volatile Context launcherAppContext;
+    private static volatile WeakReference<Activity> launcherActivityRef;
     private static volatile TileStore.FilterableMenuList liveLauncherList;
     private static volatile Object liveLauncherLock;
 
     private static volatile ClassLoader editorLoader;
+    private static volatile Context editorAppContext;
     private static volatile TileStore.FilterableMenuList liveEditorList;
 
     @Override
@@ -114,6 +128,34 @@ public final class TileModEntry extends ModEntry {
             hookLauncher(mod, app);
         } else if (PKG_EDITOR.equals(app.packageName)) {
             hookEditor(mod, app);
+        }
+    }
+
+    @Override
+    public void onEnabled(final ModContext mod, boolean enabled) {
+        final Context lCtx = launcherAppContext;
+        if (lCtx != null) {
+            triggerLiveLauncherUpdate(mod, lCtx, null);
+        }
+        final Context eCtx = editorAppContext;
+        final TileStore.FilterableMenuList eList = liveEditorList;
+        if (eCtx != null && eList != null) {
+            new Thread("hmgapi-tiles-editor-enable") {
+                @Override
+                public void run() {
+                    try {
+                        TileStore.MenuInventory inv = readMenuInventory(eCtx);
+                        Set<String> matched = new LinkedHashSet<String>();
+                        TileStore.ItemVisibilityFilter filter = makeEditorFilter(
+                                mod, eCtx, editorLoader, inv, matched, null);
+                        synchronized (eList) {
+                            eList.refilter(filter);
+                        }
+                    } catch (Throwable t) {
+                        mod.error("editor onEnabled filter", t);
+                    }
+                }
+            }.start();
         }
     }
 
@@ -127,8 +169,10 @@ public final class TileModEntry extends ModEntry {
             }
         }
         final ClassLoader cl = app.classLoader;
+        launcherLoader = cl;
         final Field itemsField = Points.field(cl, "launcher.menu_list.items");
         if (app.context != null) {
+            trackLauncherActivity(app.context);
             startLauncherReceiver(mod, app.context);
         }
         hookEntryCtor(mod, cl, "launcher.menu_entry.new", app.context, launcherInspector);
@@ -416,8 +460,19 @@ public final class TileModEntry extends ModEntry {
             }
         }
 
+        boolean hmgSynthetic = (iconId & 0xffff0000) == 0x7f7e0000
+                || (titleId & 0xffff0000) == 0x7f7e0000;
         return new EntryMeta(key, pkg, cls, title, kind, modId, itemId,
-                iconPkg, iconType, iconName, resolvedIconId);
+                iconPkg, iconType, iconName, resolvedIconId, hmgSynthetic);
+    }
+
+    private static boolean containsHmgSyntheticEntry(Collection<?> items) {
+        if (items == null) return false;
+        for (Object item : items) {
+            EntryMeta m = metaOf(item);
+            if (m != null && m.hmgSynthetic) return true;
+        }
+        return false;
     }
 
     private static TileStore.ModLauncherSpec findModLauncherSpec(String pkg, String cls) {
@@ -461,7 +516,10 @@ public final class TileModEntry extends ModEntry {
 
     private static void onLauncherLoaded(final ModContext mod, final Context ctx, final Object menuListOwner,
                                          final Field itemsField, List<Object> list, final Object lock) {
-        if (ctx != null) startLauncherReceiver(mod, ctx);
+        if (ctx != null) {
+            trackLauncherActivity(ctx);
+            startLauncherReceiver(mod, ctx);
+        }
 
         final TileStore.MenuInventory initialInv = readMenuInventory(ctx);
         final TileStore.Config initialCfg = effectiveConfig(mod, ctx, null);
@@ -496,6 +554,7 @@ public final class TileModEntry extends ModEntry {
 
         TileStore.FilterableMenuList managed;
         int hiddenNow;
+        boolean coreAlreadyPopulated;
         synchronized (lock) {
             if (list instanceof TileStore.FilterableMenuList) {
                 managed = (TileStore.FilterableMenuList) list;
@@ -511,18 +570,40 @@ public final class TileModEntry extends ModEntry {
             }
             liveLauncherList = managed;
             liveLauncherLock = lock;
+            coreAlreadyPopulated = containsHmgSyntheticEntry(managed.snapshotRaw());
         }
         if (hiddenNow > 0) {
             mod.log("launcher: hid " + hiddenNow + " tile(s) from menu list");
         }
 
-        // Sync saved menu immediately for stock tiles so gaps are compacted before HmgApi.syncSavedMenu runs
+        if (coreAlreadyPopulated) {
+            // HMG-API with PRIORITY_CORE_AFTER already appended 0x7f7e00xx mod entries and synced
+            // all_menu before our afterHookedMethod ran: finalize immediately with no 220 ms delay.
+            postHooksActive.set(true);
+            if (ctx != null) {
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    new Thread("hmgapi-tiles-immediate") {
+                        @Override
+                        public void run() {
+                            try {
+                                refreshCatalogAndSync(mod, ctx);
+                            } catch (Throwable t) {
+                                mod.error("immediate tile finalize", t);
+                            }
+                        }
+                    }.start();
+                } else {
+                    refreshCatalogAndSync(mod, ctx);
+                }
+            }
+            return;
+        }
+
+        // Fallback for HMG-API <= 1.1.0-rc.4 where HmgApi.launcher runs after mod after-hooks:
+        // compact stock gaps first, then listen for post-hook additions and finalize after 220 ms.
         if (ctx != null) {
             syncSavedMenu(mod, ctx, initialCfg, null);
         }
-
-        // Enable post-hook listener for HmgApi.launcher (which runs next in LIFO afterHookedMethod order)
-        // and schedule post-load finalisation once HmgApi.launcher + HmgApi.syncSavedMenu complete.
         postHooksActive.set(true);
         schedulePostLoadFinalize(mod, ctx);
     }
@@ -983,11 +1064,173 @@ public final class TileModEntry extends ModEntry {
         return new TileStore.Config(false, compact, Collections.<String>emptySet());
     }
 
+    private static void trackLauncherActivity(Context ctx) {
+        if (ctx == null) return;
+        Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+        launcherAppContext = appCtx;
+        if (ctx instanceof Activity) {
+            launcherActivityRef = new WeakReference<Activity>((Activity) ctx);
+        }
+        if (!(appCtx instanceof Application) || !launcherLifecycleStarted.compareAndSet(false, true)) return;
+        ((Application) appCtx).registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+            @Override
+            public void onActivityCreated(Activity act, Bundle b) {
+                launcherActivityRef = new WeakReference<Activity>(act);
+            }
+
+            @Override
+            public void onActivityStarted(Activity act) {
+                launcherActivityRef = new WeakReference<Activity>(act);
+            }
+
+            @Override
+            public void onActivityResumed(Activity act) {
+                launcherActivityRef = new WeakReference<Activity>(act);
+            }
+
+            @Override
+            public void onActivityPaused(Activity act) {}
+
+            @Override
+            public void onActivityStopped(Activity act) {}
+
+            @Override
+            public void onActivitySaveInstanceState(Activity act, Bundle b) {}
+
+            @Override
+            public void onActivityDestroyed(Activity act) {
+                WeakReference<Activity> ref = launcherActivityRef;
+                if (ref != null && ref.get() == act) launcherActivityRef = null;
+            }
+        });
+    }
+
+    private static void ensureLauncherListPopulated(Context appCtx) {
+        if (liveLauncherList != null || appCtx == null) return;
+        ClassLoader cl = launcherLoader;
+        if (cl == null || !Points.has("launcher.menu_list.new")) return;
+        try {
+            Object tmpList = Points.newInstance(cl, "launcher.menu_list.new", appCtx);
+            Points.call(cl, "launcher.menu_list.load", tmpList);
+        } catch (Throwable ignored) {
+            // Optional point unavailable or local-only on this unit; falls back to all_menu + state.json
+        }
+    }
+
+    private static void refilterLiveLauncherList(final ModContext mod, final Context appCtx,
+                                                 final TileStore.Config cfg) {
+        final TileStore.FilterableMenuList list = liveLauncherList;
+        if (list == null) return;
+        final TileStore.MenuInventory inv = readMenuInventory(appCtx);
+        final Set<String> matchedKeys = new LinkedHashSet<String>();
+        TileStore.ItemVisibilityFilter filter = new TileStore.ItemVisibilityFilter() {
+            @Override
+            public void onItemAdded(Object item) {
+                EntryMeta m = ensureMeta(appCtx, item, launcherInspector, inv, matchedKeys, null);
+                if (m != null && !m.key.isEmpty()) matchedKeys.add(m.key);
+            }
+
+            @Override
+            public boolean shouldShow(Object item) {
+                if (!mod.enabled()) return true;
+                EntryMeta m = ensureMeta(appCtx, item, launcherInspector, inv, matchedKeys, null);
+                if (m == null || m.key.isEmpty()) return true;
+                return TileStore.matchingHiddenKey(cfg.hidden, m.pkg, m.cls, m.itemId) == null;
+            }
+        };
+        Object lock = liveLauncherLock;
+        if (lock != null) {
+            synchronized (lock) {
+                preSeedMatchedKeys(list.snapshotRaw(), matchedKeys);
+                list.refilter(filter);
+            }
+        } else {
+            preSeedMatchedKeys(list.snapshotRaw(), matchedKeys);
+            list.refilter(filter);
+        }
+    }
+
+    private static void reloadLauncherUi(final ModContext mod, Context appCtx) {
+        try {
+            appCtx.getContentResolver().notifyChange(ALL_MENU, null);
+        } catch (Throwable ignored) {}
+
+        // 1. Prefer first-party HMG-API ModContext.reloadLauncher() when available
+        try {
+            Method m = ModContext.class.getMethod("reloadLauncher");
+            Object res = m.invoke(mod);
+            if (Boolean.TRUE.equals(res)) {
+                mod.log("launcher: scheduled non-killing reload via ModContext.reloadLauncher()");
+                return;
+            }
+        } catch (NoSuchMethodException ignored) {
+            // Running on HMG-API <= 1.1.0-rc.4; use tracked Launcher Activity fallback below
+        } catch (Throwable t) {
+            mod.error("ModContext.reloadLauncher", t);
+        }
+
+        // 2. Fallback for older HMG-API: recreate the tracked Launcher Activity on the main thread
+        WeakReference<Activity> ref = launcherActivityRef;
+        final Activity act = ref == null ? null : ref.get();
+        if (act != null && !act.isFinishing() && !act.isDestroyed()) {
+            new Handler(Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (!act.isFinishing() && !act.isDestroyed()) {
+                            act.recreate();
+                            mod.log("launcher: recreated Launcher activity for live tile update");
+                            return;
+                        }
+                    } catch (Throwable t) {
+                        mod.error("Launcher activity recreate", t);
+                    }
+                    android.os.Process.killProcess(android.os.Process.myPid());
+                }
+            });
+            return;
+        }
+
+        // 3. Last resort only if no Launcher Activity has been created in this process
+        mod.log("launcher: restarting background process to apply tile visibility changes");
+        android.os.Process.killProcess(android.os.Process.myPid());
+    }
+
+    private static void triggerLiveLauncherUpdate(final ModContext mod, final Context appCtx,
+                                                  final String overrideJson) {
+        if (!launcherReloadPending.compareAndSet(false, true)) return;
+        new Thread("hmgapi-tiles-sync") {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(150);
+                    TileStore.Config fresh = effectiveConfig(mod, appCtx, overrideJson);
+                    lastAppliedSignature = fresh.signature(mod.enabled());
+                    refilterLiveLauncherList(mod, appCtx, fresh);
+                    syncSavedMenu(mod, appCtx, fresh, installedCatalogKeys(appCtx));
+                    List<Object> raw = snapshotLauncherRawItems();
+                    TileStore.MenuInventory inv = readMenuInventory(appCtx);
+                    String freshCat = buildCatalogJson(appCtx, raw, inv, fresh);
+                    if (freshCat != null) {
+                        lastCatalogJson = freshCat;
+                        pushCatalogSync(appCtx, freshCat);
+                    }
+                } catch (Throwable t) {
+                    mod.error("launcher live tile sync", t);
+                } finally {
+                    launcherReloadPending.set(false);
+                }
+                reloadLauncherUi(mod, appCtx);
+            }
+        }.start();
+    }
+
     private static void startLauncherReceiver(final ModContext mod, Context ctx) {
         if (launcherReceiverStarted) return;
         synchronized (TileModEntry.class) {
             if (launcherReceiverStarted) return;
             final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+            launcherAppContext = appCtx;
             IntentFilter f = new IntentFilter();
             f.addAction(TileStore.ACTION_TILES_CHANGED);
             f.addAction(TileStore.ACTION_REQUEST_CATALOG);
@@ -1001,6 +1244,7 @@ public final class TileModEntry extends ModEntry {
                             @Override
                             public void run() {
                                 try {
+                                    ensureLauncherListPopulated(appCtx);
                                     List<Object> raw = snapshotLauncherRawItems();
                                     TileStore.MenuInventory inv = readMenuInventory(appCtx);
                                     TileStore.Config cfg = effectiveConfig(mod, appCtx, null);
@@ -1020,35 +1264,11 @@ public final class TileModEntry extends ModEntry {
                     final TileStore.Config nextCfg = effectiveConfig(mod, appCtx, overrideJson);
                     final String nextSig = nextCfg.signature(mod.enabled());
                     if (ACTION_HMGAPI_STATE.equals(action) && nextSig.equals(lastAppliedSignature)) {
-                        // A mod may have been installed/enabled/disabled: refresh catalog without killing launcher!
+                        // A mod may have been installed/enabled/disabled: refresh catalog without reloading launcher!
                         schedulePostLoadFinalize(mod, appCtx);
                         return;
                     }
-                    if (!launcherReloadPending.compareAndSet(false, true)) return;
-                    new Thread("hmgapi-tiles-sync") {
-                        @Override
-                        public void run() {
-                            try {
-                                Thread.sleep(150);
-                                TileStore.Config fresh = effectiveConfig(mod, appCtx, overrideJson);
-                                lastAppliedSignature = fresh.signature(mod.enabled());
-                                syncSavedMenu(mod, appCtx, fresh, installedCatalogKeys(appCtx));
-                                List<Object> raw = snapshotLauncherRawItems();
-                                TileStore.MenuInventory inv = readMenuInventory(appCtx);
-                                String freshCat = buildCatalogJson(appCtx, raw, inv, fresh);
-                                if (freshCat != null) {
-                                    lastCatalogJson = freshCat;
-                                    pushCatalogSync(appCtx, freshCat);
-                                }
-                            } catch (Throwable t) {
-                                mod.error("launcher live tile sync", t);
-                            } finally {
-                                launcherReloadPending.set(false);
-                            }
-                            mod.log("launcher: restarting process to apply tile visibility changes");
-                            android.os.Process.killProcess(android.os.Process.myPid());
-                        }
-                    }.start();
+                    triggerLiveLauncherUpdate(mod, appCtx, overrideJson);
                 }
             }, f);
             launcherReceiverStarted = true;
@@ -1060,6 +1280,7 @@ public final class TileModEntry extends ModEntry {
         synchronized (TileModEntry.class) {
             if (editorReceiverStarted) return;
             final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+            editorAppContext = appCtx;
             IntentFilter f = new IntentFilter();
             f.addAction(TileStore.ACTION_TILES_CHANGED);
             f.addAction(ACTION_HMGAPI_STATE);
