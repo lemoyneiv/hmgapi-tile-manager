@@ -1061,7 +1061,7 @@ public final class TileCatalogProvider extends ContentProvider {
                 JSONObject leg = new JSONObject(readUtf8(legacy));
                 JSONObject migrated = new JSONObject();
                 migrated.put("configured", true);
-                migrated.put("compact_gaps", leg.optBoolean("compact_gaps", true));
+                migrated.put("compact_gaps", false);
                 JSONArray hidden = leg.optJSONArray("hidden");
                 migrated.put("hidden", hidden != null ? hidden : new JSONArray());
                 migrated.put("synced_hmgapi", false);
@@ -1102,7 +1102,6 @@ public final class TileCatalogProvider extends ContentProvider {
             JSONObject settings = self.optJSONObject("settings");
             if (settings == null) return null;
 
-            boolean compact = settings.optBoolean("compact_gaps", true);
             String rawHidden = settings.optString("hidden_keys", "");
             Set<String> norm = new LinkedHashSet<String>();
             if (rawHidden != null && !rawHidden.isEmpty()) {
@@ -1111,10 +1110,10 @@ public final class TileCatalogProvider extends ContentProvider {
                     if (!k.isEmpty()) norm.add(k);
                 }
             }
-            boolean isConfigured = settings.optBoolean("configured", false) || !norm.isEmpty() || !compact;
+            boolean isConfigured = settings.optBoolean("configured", false) || !norm.isEmpty();
             JSONObject out = new JSONObject();
             out.put("configured", isConfigured);
-            out.put("compact_gaps", compact);
+            out.put("compact_gaps", false);
             JSONArray arr = new JSONArray();
             for (String k : norm) arr.put(k);
             out.put("hidden", arr);

@@ -2,7 +2,7 @@
 
 A **Material Design 3** launcher & menu-editor customization mod for **Hyundai, Kia, and Genesis Gen5W** widescreen head units running **[HMG-API](https://github.com/Open-HMG/HMG-API)** (`>= 1.0.0`).
 
-Declutter your Gen5W **All Menus / Home Screen** and **Home Screen Menu Editor** by hiding unused built-in apps (*Voice Memo*, *Kia/Bluelink Connect*, *Valet Mode*, *Quiet Mode*, *HD Radio Data*, etc.) or background mod shortcuts, automatically closing empty grid gaps, and non-destructively backing up hidden tiles so they return to their exact saved slot whenever you toggle them back on.
+Declutter your Gen5W **All Menus / Home Screen** and **Home Screen Menu Editor** by hiding unused built-in apps (*Voice Memo*, *Kia/Bluelink Connect*, *Valet Mode*, *Quiet Mode*, *HD Radio Data*, etc.) or background mod shortcuts while keeping blank spaces intact, collapsing empty spaces on demand whenever you want to pack tiles left, and non-destructively backing up hidden tiles so they return to their exact saved slot whenever you toggle them back on.
 
 > **Runs on 100% stock upstream HMG-API (`>= 1.0.0`)** — uses only official public `launcher.*` and `homesetting.*` observe hooks with zero `/system` file modifications and zero core patches.
 
@@ -12,15 +12,15 @@ Declutter your Gen5W **All Menus / Home Screen** and **Home Screen Menu Editor**
 
 - **Show or Hide Any Stock or Mod Tile (`live: true`)**
   - Works across both **built-in Gen5W system apps** (`itemId 1..38`) and **HMG-API / NEMESIS / sideloaded mod tiles** (`itemId >= 9000`).
-  - Filters hidden tiles out of both the **Gen5W Home Screen (`com.android.launcher3`)** and the **Home Screen Menu Editor (`com.hkmc.system.app.homesetting`)**, applying changes live without rebooting the head unit.
+  - Filters hidden tiles out of both the **Gen5W Home Screen (`com.android.launcher3`)** and the **Home Screen Menu Editor (`com.hkmc.system.app.homesetting`)**, leaving blank spaces in place by default and applying changes live without rebooting the head unit.
 - **Per-Profile Non-Destructive Backup & Restore**
   - Before hiding any tile from `content://com.hkmc.system.app.homesetting.provider/all_menu`, Tile Manager records its exact `packageName`, `className`, `itemId`, and `slot` per driver profile (*Driver 1*, *Driver 2*, *Guest*).
   - Toggling a tile back **ON** (or tapping **Show All**) restores it to its original slot if empty—or the next open slot—while automatically pruning backups for any mod/app uninstalled while hidden so phantom blank tiles never appear.
 - **Full Stock *Edit Home Icons* Integration & One-Tap Launch**
   - Tap **Edit Home Icons** directly from Tile Manager's header to open Gen5W's native multi-page drag-and-drop icon arranger on top of Tile Manager (press **Back** to return right to Tile Manager).
   - Reorder tiles or place intentional multi-page spacers in stock *Edit Home Icons*—Tile Manager preserves your custom order and spacing across reloads and reboots even while other tiles remain hidden.
-- **Event-Driven Empty Gap Compaction**
-  - Optional **Close Empty Gaps** toggle packs visible tiles left whenever you hide a tile or turn compaction ON, without stripping intentional multi-page layouts saved afterward.
+- **On-Demand *Collapse Empty Spaces* Action**
+  - Hiding tiles leaves blank slots untouched so your Home Screen page layout never shifts unexpectedly; tap **Collapse Empty Spaces** anytime to pack remaining visible tiles left on demand.
 - **Material Design 3 Widescreen Interface (`1920×720`)**
   - Adaptive **Day / Night** M3 tonal surfaces (`UiModeManager`), animated stadium switches, genuine Gen5W launcher icons (`Launcher_WP3`) alongside custom mod icons, **All Home Tiles / Packages & Mods / System Apps** navigation rail, one-tap **Show All** self-healing recovery, and safety prompts before hiding critical management apps (*HMG-API*, *NEMESIS*, *Tile Manager*, *Setup*).
   - Supports **NEMESIS Manager → Launch**, **HMG-API Star (★) Key** binding, and stock-gradient Gen5W launcher tiles.

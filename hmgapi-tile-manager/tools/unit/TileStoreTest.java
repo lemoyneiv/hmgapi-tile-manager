@@ -828,6 +828,68 @@ public final class TileStoreTest {
         check("compacted reorder slot 3 Setup", "com.android.settings", slotPkg(reorderedCompacted.updatedMenuJson, 3));
         check("compacted reorder slot 4 Empty view", "Empty view", slotPkg(reorderedCompacted.updatedMenuJson, 4));
 
+        // 20. v1.0.6: auto-collapse disabled by default; Collapse Empty Spaces button (forceCompact=true)
+        //     collapses gaps on demand even when compactGaps=false or when zero tiles are hidden
+        TileStore.Config defaultParsed = TileStore.parseConfig("{\"hidden\":[\"com.hkmc.radio/.RadioActivity\"]}", true);
+        check("parseConfig defaults compactGaps to false when omitted",
+                Boolean.FALSE, Boolean.valueOf(defaultParsed.compactGaps));
+        TileStore.Config emptyParsed = TileStore.parseConfig("", false);
+        check("empty parseConfig defaults compactGaps to false",
+                Boolean.FALSE, Boolean.valueOf(emptyParsed.compactGaps));
+        TileStore.Config missingFileCfg = TileStore.readFileConfig(new File("/nonexistent/tile-cfg.json"));
+        check("missing file readFileConfig defaults compactGaps to false",
+                Boolean.FALSE, Boolean.valueOf(missingFileCfg.compactGaps));
+
+        Map<String, Object> v106Backups = new LinkedHashMap<String, Object>();
+        TileStore.SyncResult hideLeaveBlank = TileStore.syncProfileMenu(
+                "Driver 1", sampleGrid(), defaultParsed, installed, v106Backups);
+        checkTrue("hiding Radio with default config updates menu", hideLeaveBlank.updatedMenuJson != null);
+        check("default hide keeps EV at slot 0", "com.hkmc.ev", slotPkg(hideLeaveBlank.updatedMenuJson, 0));
+        check("default hide leaves blank Empty view at slot 1 (no auto-collapse)",
+                "Empty view", slotPkg(hideLeaveBlank.updatedMenuJson, 1));
+        check("default hide keeps Comfort in place at slot 2",
+                "dev.lemoyne.comfort", slotPkg(hideLeaveBlank.updatedMenuJson, 2));
+        check("default hide keeps HMG-API in place at slot 3",
+                "hmgapi.app", slotPkg(hideLeaveBlank.updatedMenuJson, 3));
+
+        // Tapping "Collapse Empty Spaces" (forceCompact=true) while compactGaps=false collapses slot 1 on demand
+        TileStore.SyncResult collapseOnDemand = TileStore.syncProfileMenu(
+                "Driver 1", hideLeaveBlank.updatedMenuJson, defaultParsed,
+                null, v106Backups, null, null, true);
+        checkTrue("Collapse Empty Spaces (forceCompact=true, compactGaps=false) updates menu",
+                collapseOnDemand.updatedMenuJson != null);
+        check("on-demand collapse keeps EV at slot 0", "com.hkmc.ev", slotPkg(collapseOnDemand.updatedMenuJson, 0));
+        check("on-demand collapse shifts Comfort into slot 1",
+                "dev.lemoyne.comfort", slotPkg(collapseOnDemand.updatedMenuJson, 1));
+        check("on-demand collapse shifts HMG-API into slot 2",
+                "hmgapi.app", slotPkg(collapseOnDemand.updatedMenuJson, 2));
+        check("on-demand collapse trails Empty view at slot 3",
+                "Empty view", slotPkg(collapseOnDemand.updatedMenuJson, 3));
+
+        // Hiding another tile afterward STILL leaves its blank space intact (not sticky!)
+        TileStore.Config hideTwoDefault = TileStore.parseConfig(
+                "{\"hidden\":[\"com.hkmc.radio/.RadioActivity\",\"dev.lemoyne.comfort/dev.lemoyne.comfort.MainActivity\"]}", true);
+        TileStore.SyncResult hideSecondLeaveBlank = TileStore.syncProfileMenu(
+                "Driver 1", collapseOnDemand.updatedMenuJson, hideTwoDefault, installed, v106Backups);
+        checkTrue("subsequent hide updates menu", hideSecondLeaveBlank.updatedMenuJson != null);
+        check("subsequent hide leaves blank Empty view at slot 1",
+                "Empty view", slotPkg(hideSecondLeaveBlank.updatedMenuJson, 1));
+        check("subsequent hide keeps HMG-API in place at slot 2",
+                "hmgapi.app", slotPkg(hideSecondLeaveBlank.updatedMenuJson, 2));
+
+        // Tapping "Collapse Empty Spaces" even when NO tiles are hidden (exists=false, hidden empty) still works
+        TileStore.SyncResult collapseUnconfigured = TileStore.syncProfileMenu(
+                "Driver 1", stockEditedWithSpacer, new TileStore.Config(false, false, Collections.<String>emptySet()),
+                null, new LinkedHashMap<String, Object>(), null, null, true);
+        checkTrue("Collapse Empty Spaces works even when unconfigured / zero hidden tiles",
+                collapseUnconfigured.updatedMenuJson != null);
+        check("unconfigured collapse packs HMG-API at slot 0",
+                "hmgapi.app", slotPkg(collapseUnconfigured.updatedMenuJson, 0));
+        check("unconfigured collapse packs EV at slot 1",
+                "com.hkmc.ev", slotPkg(collapseUnconfigured.updatedMenuJson, 1));
+        check("unconfigured collapse trails Empty view at slot 2",
+                "Empty view", slotPkg(collapseUnconfigured.updatedMenuJson, 2));
+
         System.out.println("TileStoreTest: " + checks + " checks passed");
     }
 

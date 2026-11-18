@@ -50,8 +50,8 @@ import java.util.concurrent.Executors;
 
 /**
  * Material Design 3 widescreen automotive interface for Home Screen Tile Manager (1920x720 Gen5W):
- *  - Left M3 Navigation & Summary Rail: author/version credit, compact Visible/Total & Close Empty
- *    Gaps card, and 3 category destinations (All Home Tiles, Packages & Mods, System Apps)
+ *  - Left M3 Navigation & Summary Rail: author/version credit, compact Visible/Total & on-demand
+ *    Collapse Empty Spaces card, and 3 category destinations (All Home Tiles, Packages & Mods, System Apps)
  *  - Right Contextual Pane: header with Refresh, Show All, and direct Edit Home Icons launcher
  *    above a 2-column automotive visibility grid
  */
@@ -69,7 +69,6 @@ public final class MainActivity extends Activity {
     private final List<TileWidgets.TileItem> catalogItems = new ArrayList<TileWidgets.TileItem>();
     private final Set<String> hiddenKeys = new LinkedHashSet<String>();
 
-    private boolean compactGaps = true;
     private boolean hmgApiConnected;
     private boolean hookOutdated;
     private int saveGeneration;
@@ -80,7 +79,6 @@ public final class MainActivity extends Activity {
     private TextView lblConnSub;
     private TextView lblHeroCount;
     private TextView lblHeroChip;
-    private TileWidgets.M3Switch swCompactGaps;
     private final LinearLayout[] navItems = new LinearLayout[3];
     private final TileIcons[] navIcons = new TileIcons[3];
     private final TextView[] navLabels = new TextView[3];
@@ -212,7 +210,7 @@ public final class MainActivity extends Activity {
         brandText.addView(title);
 
         TextView lblAuthor = new TextView(this);
-        lblAuthor.setText("by lemoyneiv · v1.0.5");
+        lblAuthor.setText("by lemoyneiv · v1.0.6");
         lblAuthor.setTextColor(ON_SURFACE_VAR);
         lblAuthor.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         lblAuthor.setSingleLine(true);
@@ -233,7 +231,7 @@ public final class MainActivity extends Activity {
         brand.addView(brandText, btp);
         rail.addView(brand);
 
-        // 2. Compact Visibility & Gap-Compaction Card
+        // 2. Compact Visibility & On-Demand Collapse Empty Spaces Card
         LinearLayout hero = new LinearLayout(this);
         hero.setOrientation(LinearLayout.VERTICAL);
         hero.setBackground(shape(SURFACE_HIGH, OUTLINE_VAR, Math.max(1, d(1)), d(16)));
@@ -263,59 +261,20 @@ public final class MainActivity extends Activity {
         div.setBackgroundColor(OUTLINE_VAR);
         LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, d(1)));
         dp.topMargin = d(8);
-        dp.bottomMargin = d(7);
+        dp.bottomMargin = d(8);
         hero.addView(div, dp);
 
-        // Close Empty Gaps switch row inside hero card
-        LinearLayout gapRow = new LinearLayout(this);
-        gapRow.setOrientation(LinearLayout.HORIZONTAL);
-        gapRow.setGravity(Gravity.CENTER_VERTICAL);
-
-        View gapIcon = new View(this);
-        gapIcon.setBackground(new TileIcons(TileIcons.COMPACT, PRIMARY));
-        gapRow.addView(gapIcon, new LinearLayout.LayoutParams(d(17), d(17)));
-
-        LinearLayout gapCols = new LinearLayout(this);
-        gapCols.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams gcp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        gcp.leftMargin = d(8);
-        gcp.rightMargin = d(6);
-
-        TextView gapTitle = new TextView(this);
-        gapTitle.setText("Close Empty Gaps");
-        gapTitle.setTextColor(ON_SURFACE);
-        gapTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        gapTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        gapTitle.setSingleLine(true);
-        gapCols.addView(gapTitle);
-
-        TextView gapSub = new TextView(this);
-        gapSub.setText("Shift remaining tiles left");
-        gapSub.setTextColor(ON_SURFACE_VAR);
-        gapSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
-        gapSub.setSingleLine(true);
-        gapCols.addView(gapSub);
-        gapRow.addView(gapCols, gcp);
-
-        swCompactGaps = new TileWidgets.M3Switch(this, compactGaps, new TileWidgets.ToggleListener() {
-            @Override
-            public void onToggle(boolean checked) {
-                compactGaps = checked;
-                persistAndBroadcast(false, null, checked);
-            }
-        });
-        gapRow.addView(swCompactGaps);
-        gapRow.setClickable(true);
-        gapRow.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                boolean next = !compactGaps;
-                compactGaps = next;
-                swCompactGaps.setChecked(next, true);
-                persistAndBroadcast(false, null, next);
-            }
-        });
-        hero.addView(gapRow);
+        // On-demand Collapse Empty Spaces button (hiding tiles leaves blank spaces intact by default)
+        LinearLayout btnCollapseSpaces = TileWidgets.m3Button(
+                this, TileIcons.COMPACT, "Collapse Empty Spaces", TileWidgets.BTN_TONAL, 38,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        persistAndBroadcast(false, null, true);
+                    }
+                });
+        hero.addView(btnCollapseSpaces, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         rail.addView(hero, heroLp);
 
         // 3. M3 Navigation Destinations (3 categories with generous headroom on 240dpi & 160dpi 720p)
@@ -714,13 +673,11 @@ public final class MainActivity extends Activity {
 
     private void applyLoadedState(String cfgJson, JSONObject daemonSettings, String catJson) {
         Set<String> loadedHidden = new LinkedHashSet<String>();
-        boolean loadedCompact = true;
         boolean parsedLocal = false;
 
         if (cfgJson != null && !cfgJson.trim().isEmpty()) {
             try {
                 JSONObject o = new JSONObject(cfgJson);
-                loadedCompact = o.optBoolean("compact_gaps", true);
                 JSONArray arr = o.optJSONArray("hidden");
                 if (arr != null) {
                     for (int i = 0; i < arr.length(); i++) {
@@ -733,7 +690,6 @@ public final class MainActivity extends Activity {
         }
 
         if (!parsedLocal && daemonSettings != null) {
-            loadedCompact = daemonSettings.optBoolean("compact_gaps", true);
             String raw = daemonSettings.optString("hidden_keys", "");
             if (raw != null && !raw.isEmpty()) {
                 for (String part : raw.split(",")) {
@@ -826,13 +782,11 @@ public final class MainActivity extends Activity {
         });
 
         hookOutdated = loadedOutdated;
-        compactGaps = loadedCompact;
         hiddenKeys.clear();
         hiddenKeys.addAll(loadedHidden);
         catalogItems.clear();
         catalogItems.addAll(items);
 
-        swCompactGaps.setChecked(compactGaps, false);
         renderAll();
     }
 
@@ -898,7 +852,6 @@ public final class MainActivity extends Activity {
 
     private void persistAndBroadcast(final boolean forceRestoreAll, final String unhiddenKey,
                                      final boolean forceCompact) {
-        final boolean snapCompact = compactGaps;
         final Set<String> snapHidden = new LinkedHashSet<String>();
         for (String hk : hiddenKeys) {
             if (catalogItems.isEmpty() || matchesExistingCatalogItem(catalogItems, hk)
@@ -911,15 +864,18 @@ public final class MainActivity extends Activity {
         final int gen = ++saveGeneration;
         lastSaveUptimeMs = SystemClock.uptimeMillis();
 
-        lblSaveStatus.setText("Applying live…");
+        lblSaveStatus.setText(forceCompact ? "Collapsing spaces…" : "Applying live…");
         lblSaveStatus.setTextColor(PRIMARY);
 
         io.execute(new Runnable() {
             @Override
             public void run() {
-                String configPayload = buildBroadcastConfigJson(snapCompact, snapHidden);
-                // 1. Write immediately to local provider store so launcher3/homesetting pull fresh config
-                TileCatalogProvider.writeLocalConfig(MainActivity.this, snapCompact, snapHidden, false);
+                // Pass forceCompact in the transient broadcast JSON so pre-reboot v1.0.5 hooks
+                // also collapse empty spaces on demand, while persisted config always keeps
+                // compact_gaps=false so hiding tiles never auto-collapses spaces.
+                String configPayload = buildBroadcastConfigJson(forceCompact, snapHidden);
+                // 1. Write immediately to local provider store with auto-collapse disabled
+                TileCatalogProvider.writeLocalConfig(MainActivity.this, false, snapHidden, false);
 
                 // 2. Broadcast live update to com.android.launcher3 and com.hkmc.system.app.homesetting
                 try {
@@ -944,11 +900,11 @@ public final class MainActivity extends Activity {
                     if (api.available()) {
                         JSONObject s = new JSONObject();
                         s.put("configured", true);
-                        s.put("compact_gaps", snapCompact);
+                        s.put("compact_gaps", false);
                         s.put("hidden_keys", joinKeys(snapHidden));
                         api.saveSettings(s);
                         syncedDaemon = true;
-                        TileCatalogProvider.writeLocalConfig(MainActivity.this, snapCompact, snapHidden, true);
+                        TileCatalogProvider.writeLocalConfig(MainActivity.this, false, snapHidden, true);
                     }
                 } catch (Throwable ignored) {}
 
@@ -959,7 +915,9 @@ public final class MainActivity extends Activity {
                         if (isFinishing() || gen != saveGeneration) return;
                         hmgApiConnected = okDaemon || hmgApiConnected;
                         updateRailHeader();
-                        showStatus(forceRestoreAll ? "All tiles restored" : "Home screen updated");
+                        showStatus(forceRestoreAll
+                                ? "All tiles restored"
+                                : (forceCompact ? "Empty spaces collapsed" : "Home screen updated"));
                         ui.postDelayed(new Runnable() {
                             @Override
                             public void run() {

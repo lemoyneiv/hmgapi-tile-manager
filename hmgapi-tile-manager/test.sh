@@ -36,8 +36,9 @@ has "apk contains refreshCatalog" "refreshCatalog" "$APK_STRINGS"
 has "apk contains force_restore_all" "force_restore_all" "$APK_STRINGS"
 has "apk contains ACTION_OPEN_STOCK_EDITOR" "dev.lemoyne.tiles.ACTION_OPEN_STOCK_EDITOR" "$APK_STRINGS"
 has "apk contains Edit Home Icons button" "Edit Home Icons" "$APK_STRINGS"
+has "apk contains Collapse Empty Spaces button" "Collapse Empty Spaces" "$APK_STRINGS"
 has "apk contains author credit" "by lemoyneiv" "$APK_STRINGS"
-has "apk contains v1.0.5 header" "v1.0.5" "$APK_STRINGS"
+has "apk contains v1.0.6 header" "v1.0.6" "$APK_STRINGS"
 
 HOOK_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/src/dev/lemoyne/tiles/hook/TileStore.java" | head -n 1)
 APP_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/app/java/dev/lemoyne/tiles/TileCatalogProvider.java" | head -n 1)
@@ -63,7 +64,7 @@ eng apply
 check "engine apply succeeds" 0 "$rc"
 has "mod published as on" "1 of 1 mods on" "$out"
 has "mod in public state.json" '"hmgapi-tile-manager"' "$(cat "$R/data/hmgapi/public/state.json")"
-has "default compact_gaps in public state.json" '"compact_gaps": true' "$(cat "$R/data/hmgapi/public/state.json")"
+has "default hidden_keys in public state.json" '"hidden_keys": ""' "$(cat "$R/data/hmgapi/public/state.json")"
 
 printf '{"compact_gaps":false,"hidden_keys":"com.hkmc.radio/com.hkmc.radio.RadioActivity"}\n' \
     > "$R/data/hmgapi/settings/hmgapi-tile-manager.json"

@@ -1736,14 +1736,14 @@ public final class TileStore {
     @SuppressWarnings("unchecked")
     public static Config parseConfig(String jsonText, boolean exists) {
         if (jsonText == null || jsonText.trim().isEmpty()) {
-            return new Config(false, true, Collections.<String>emptySet());
+            return new Config(false, false, Collections.<String>emptySet());
         }
         Map<String, Object> m = parseObject(jsonText);
         boolean configured = exists;
         if (m.containsKey("configured")) {
             configured = Boolean.TRUE.equals(m.get("configured"));
         }
-        boolean compact = !Boolean.FALSE.equals(m.get("compact_gaps"));
+        boolean compact = Boolean.TRUE.equals(m.get("compact_gaps"));
         Set<String> hidden = new LinkedHashSet<String>();
         Object rawHidden = m.get("hidden");
         if (rawHidden instanceof List) {
@@ -1771,12 +1771,12 @@ public final class TileStore {
 
     public static Config readFileConfig(File file) {
         if (file == null || !file.isFile()) {
-            return new Config(false, true, Collections.<String>emptySet());
+            return new Config(false, false, Collections.<String>emptySet());
         }
         try {
             return parseConfig(readUtf8(file), true);
         } catch (Exception ignored) {
-            return new Config(false, true, Collections.<String>emptySet());
+            return new Config(false, false, Collections.<String>emptySet());
         }
     }
 
@@ -2011,11 +2011,10 @@ public final class TileStore {
             }
         }
 
-        // 4. Event-driven gap compaction: close empty gaps only when a tile was newly hidden
-        //    or when compaction was explicitly requested (e.g. toggling Close Empty Gaps ON),
-        //    so passive Launcher_WP3 reloads never strip multi-page spacing saved in stock
-        //    Edit Home Icons or Tile Manager's Arrange Order UI.
-        if (cfg.exists && cfg.compactGaps && (newlyHidAny || forceCompact)) {
+        // 4. On-demand gap compaction: collapse empty spaces when explicitly requested via
+        //    forceCompact (e.g. tapping Collapse Empty Spaces in Tile Manager), or when explicit
+        //    compactGaps is set on a fresh hide event, without stripping multi-page spacing on passive reloads.
+        if (forceCompact || (cfg.exists && cfg.compactGaps && newlyHidAny)) {
             List<Object> nonEmpty = new ArrayList<Object>();
             for (int k = 0; k < arr.size(); k++) {
                 if (!slotEmpty(arr.get(k))) nonEmpty.add(arr.get(k));

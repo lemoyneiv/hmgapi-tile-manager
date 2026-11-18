@@ -202,7 +202,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("launcher tile manager v1.0.5 active in " + app.processName);
+        mod.log("launcher tile manager v1.0.6 active in " + app.processName);
     }
 
     private void hookEditor(final ModContext mod, final LoadedApp app) {
@@ -237,7 +237,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("menu editor tile manager v1.0.5 active in " + app.processName);
+        mod.log("menu editor tile manager v1.0.6 active in " + app.processName);
     }
 
     private static void hookEntryCtor(final ModContext mod, ClassLoader cl, String pointId,
@@ -1055,7 +1055,8 @@ public final class TileModEntry extends ModEntry {
         }
         if (overrideJson != null && !overrideJson.isEmpty()) {
             try {
-                return TileStore.parseConfig(overrideJson, true);
+                TileStore.Config c = TileStore.parseConfig(overrideJson, true);
+                return new TileStore.Config(c.exists, false, c.hidden);
             } catch (Throwable ignored) {}
         }
         // 1. Live provider config (instant cross-process sync from TileManager UI)
@@ -1066,7 +1067,7 @@ public final class TileModEntry extends ModEntry {
                     String json = b.getString("config_json");
                     if (json != null && !json.isEmpty()) {
                         TileStore.Config c = TileStore.parseConfig(json, true);
-                        if (c.exists) return c;
+                        if (c.exists) return new TileStore.Config(true, false, c.hidden);
                     }
                 }
             } catch (Throwable ignored) {}
@@ -1075,8 +1076,7 @@ public final class TileModEntry extends ModEntry {
         String rawHidden = mod.settingString("hidden_keys", "");
         boolean hasHidden = rawHidden != null && !rawHidden.trim().isEmpty();
         boolean configuredFlag = mod.settingBoolean("configured", false);
-        boolean compact = mod.settingBoolean("compact_gaps", true);
-        if (configuredFlag || hasHidden || !compact) {
+        if (configuredFlag || hasHidden) {
             Set<String> hidden = new LinkedHashSet<String>();
             if (rawHidden != null && !rawHidden.isEmpty()) {
                 for (String part : rawHidden.split(",")) {
@@ -1084,15 +1084,15 @@ public final class TileModEntry extends ModEntry {
                     if (!k.isEmpty()) hidden.add(k);
                 }
             }
-            return new TileStore.Config(true, compact, hidden);
+            return new TileStore.Config(true, false, hidden);
         }
         // 3. Automatic migration from legacy lemoyneiv/HMG-API public/launcher-tiles.json
         File legacy = new File(TileStore.LEGACY_PUBLIC_CONFIG);
         if (legacy.isFile()) {
             TileStore.Config c = TileStore.readFileConfig(legacy);
-            if (c.exists) return c;
+            if (c.exists) return new TileStore.Config(true, false, c.hidden);
         }
-        return new TileStore.Config(false, compact, Collections.<String>emptySet());
+        return new TileStore.Config(false, false, Collections.<String>emptySet());
     }
 
     private static void trackLauncherActivity(Context ctx) {
