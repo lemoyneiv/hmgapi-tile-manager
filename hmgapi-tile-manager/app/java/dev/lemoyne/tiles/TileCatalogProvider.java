@@ -35,11 +35,11 @@ import java.util.Set;
 /**
  * Lightweight IPC ContentProvider bridging com.android.launcher3, com.hkmc.system.app.homesetting,
  * and the Tile Manager UI on stock Open-HMG/HMG-API without requiring any core daemon changes:
- *  - putCatalog / getCatalog / refreshCatalog: live schema-5 catalog of equipped stock + custom/mod tiles
+ *  - putCatalog / getCatalog / refreshCatalog: live schema-6 catalog of equipped stock + custom/mod tiles
  *  - getConfig / putConfig: instant cross-process tile visibility & gap-compaction settings
  */
 public final class TileCatalogProvider extends ContentProvider {
-    static final int CATALOG_SCHEMA = 5;
+    static final int CATALOG_SCHEMA = 6;
     static final String AUTHORITY = "dev.lemoyne.tiles.provider";
     static final Uri URI = Uri.parse("content://" + AUTHORITY);
     static final Uri ALL_MENU = Uri.parse("content://com.hkmc.system.app.homesetting.provider/all_menu");
@@ -361,6 +361,7 @@ public final class TileCatalogProvider extends ContentProvider {
                                     && !isEquippedInMenu(key, pkg, cls, itemId, activeMenuKeys,
                                             activeMenuPackages, activeMenuItemIds, multiEntryPackages)
                                     && !isUnconditionalCoreStockTile(finalTitle, pkg, cls)
+                                    && !isLauncherGatedPseudoTile(pkg, cls)
                                     && !isKeyHidden(hidden, key, pkg, cls, itemId)) {
                                 continue;
                             }
@@ -546,6 +547,9 @@ public final class TileCatalogProvider extends ContentProvider {
                 itemId = priorWildcard.optInt("itemId", -1);
             }
         }
+        if ("system".equals(kind) && (itemId <= 0 || itemId == 39)) {
+            itemId = defaultStockItemId(pkg, cls);
+        }
         JSONObject row = new JSONObject();
         row.put("key", key);
         row.put("packageName", pkg);
@@ -643,7 +647,7 @@ public final class TileCatalogProvider extends ContentProvider {
                 || p.equals("com.hkmc.btphone")) {
             return true;
         }
-        if ("phone projection".equals(t) || p.contains(".projection")
+        if ("phone projection".equals(t) || "phoneprojection_packagename".equals(p) || p.contains(".projection")
                 || p.equals("com.daudio.app.dipo") || p.equals("com.google.android.projection.sink")) {
             return true;
         }
@@ -662,6 +666,96 @@ public final class TileCatalogProvider extends ContentProvider {
             return true;
         }
         return false;
+    }
+
+    private static String[] stockPseudoTargetPackages(String pkg) {
+        String low = clean(pkg).toLowerCase(Locale.US);
+        if (low.isEmpty()) return null;
+        if ("carpay".equals(low)) {
+            return new String[] {
+                "com.hkmc.telematics.app.paymentnew",
+                "com.hkmc.telematics.app.payment",
+                "com.hkmc.telematics.apps.carpay",
+                "com.hkmc.carpay"
+            };
+        }
+        if ("notification".equals(low)) {
+            return new String[] {
+                "com.hkmc.telematics.apps.Notification",
+                "com.hkmc.telematics.app.notification",
+                "com.hkmc.notification"
+            };
+        }
+        if ("valetmode".equals(low)) {
+            return new String[] {
+                "com.hkmc.telematics.apps.valetMode",
+                "com.hkmc.telematics.app.valetmode",
+                "com.hmc.valetmode",
+                "com.hkmc.valetmode"
+            };
+        }
+        if ("phoneprojection_packagename".equals(low)) {
+            return new String[] {
+                "com.daudio.app.phoneprojection",
+                "com.daudio.app.dipo",
+                "com.google.android.projection.sink",
+                "com.baidu.carlifevehicle",
+                "com.daudio.app.mirrorlink"
+            };
+        }
+        if ("drvm".equals(low)) {
+            return new String[] {
+                "com.hkmc.system.app.rearcamera",
+                "com.hkmc.av.app.rearcamera"
+            };
+        }
+        return null;
+    }
+
+    private static String stockPseudoPackageForClass(String cls) {
+        String low = clean(cls).toLowerCase(Locale.US);
+        if ("phoneprojection_classname".equals(low)) return "PhoneProjection_PackageName";
+        if ("carpay".equals(low)) return "carpay";
+        if ("notification".equals(low)) return "notification";
+        if ("valetmode".equals(low)) return "valetmode";
+        if ("drvm".equals(low)) return "DRVM";
+        return null;
+    }
+
+    private static boolean isLauncherGatedPseudoTile(String pkg, String cls) {
+        String low = clean(pkg).toLowerCase(Locale.US);
+        if (low.isEmpty()) low = clean(stockPseudoPackageForClass(cls)).toLowerCase(Locale.US);
+        return "carpay".equals(low)
+                || "notification".equals(low)
+                || "valetmode".equals(low)
+                || "phoneprojection_packagename".equals(low);
+    }
+
+    private static int defaultStockItemId(String pkg, String cls) {
+        String p = clean(pkg);
+        String c = clean(cls);
+        String fullCls = (!p.isEmpty() && c.startsWith(".")) ? p + c : c;
+        String lowP = p.toLowerCase(Locale.US);
+        String lowC = fullCls.toLowerCase(Locale.US);
+        if ("phoneprojection_packagename".equals(lowP) || "phoneprojection_classname".equals(lowC)) return 4;
+        if ("valetmode".equals(lowP) || "valetmode".equals(lowC)) return 14;
+        if ("carpay".equals(lowP) || "carpay".equals(lowC)) return 21;
+        if ("notification".equals(lowP) || "notification".equals(lowC)) return 23;
+        if ("com.mnsoft.navi.mapapp".equals(lowC)) return 1;
+        if ("com.mnsoft.navi.naviapp".equals(lowC) || ("com.mnsoft.navi".equals(lowP) && (c.isEmpty() || "*".equals(c)))) return 2;
+        if ("com.android.contacts.dialtactsactivity".equals(lowC)) return 3;
+        if ("com.daudio.app.voicememo.mainactivity".equals(lowC)) return 6;
+        if ("com.hkmc.system.app.mymenu.mymenuactivity".equals(lowC)) return 7;
+        if ("com.android.settings.settings".equals(lowC)) return 8;
+        if (lowP.startsWith("com.hkmc.av.app.radio") && lowC.endsWith(".radiomainactivity")) return 9;
+        if ("com.daudio.av.app.usbmusic.ui.musicactivity".equals(lowC)) return 11;
+        if ("com.hkmc.telematics.apps.vrm.main.bluelinkuvomenu".equals(lowC)) return 12;
+        if ("com.android.settings.customviews.webmanualsub".equals(lowC)
+                || "com.android.settings.customviews.manualanddrivingtip".equals(lowC)) {
+            return 24;
+        }
+        if (lowP.startsWith("com.hkmc.daudio.app.") && lowC.endsWith(".igncheckactivity")) return 29;
+        return -1;
     }
 
     static Map<String, String> readModPackagesMap() {
@@ -757,6 +851,28 @@ public final class TileCatalogProvider extends ContentProvider {
     private static boolean isTargetComponentInstalled(Context ctx, String pkg, String cls) {
         String p = clean(pkg);
         if (ctx == null || p.isEmpty()) return true;
+        String[] pseudoTargets = stockPseudoTargetPackages(p);
+        if (pseudoTargets != null) {
+            PackageManager pm = ctx.getPackageManager();
+            if (pm == null) return true;
+            for (String targetPkg : pseudoTargets) {
+                try {
+                    ApplicationInfo ai = pm.getApplicationInfo(targetPkg, 0);
+                    if (ai == null || !ai.enabled) continue;
+                    try {
+                        int appState = pm.getApplicationEnabledSetting(targetPkg);
+                        if (appState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED || appState == 3) {
+                            continue;
+                        }
+                    } catch (Throwable ignored) {}
+                    return true;
+                } catch (PackageManager.NameNotFoundException ignored) {
+                } catch (Throwable ignored) {
+                    return true;
+                }
+            }
+            return false;
+        }
         try {
             PackageManager pm = ctx.getPackageManager();
             ApplicationInfo ai = pm.getApplicationInfo(p, 0);
@@ -1006,19 +1122,30 @@ public final class TileCatalogProvider extends ContentProvider {
 
     static String friendlyTitle(String rawLabel, String pkg, String cls) {
         String label = rawLabel == null ? "" : rawLabel.trim();
+        String p = clean(pkg);
+        String c = clean(cls);
         boolean technical = label.isEmpty() || label.startsWith("HKMC_") || label.endsWith("_WP")
                 || label.endsWith("_WP3") || label.equalsIgnoreCase("QRManual")
-                || (label.indexOf('.') > 0 && label.indexOf(' ') < 0) || label.equals(pkg);
+                || label.equalsIgnoreCase("AppManual")
+                || (label.indexOf('.') > 0 && label.indexOf(' ') < 0)
+                || label.equalsIgnoreCase(p)
+                || stockPseudoTargetPackages(label) != null
+                || stockPseudoPackageForClass(label) != null;
         if (!technical) return label;
-        String probe = (pkg + "/" + cls + " " + label).toLowerCase(Locale.US);
-        if (probe.contains("qrmanual") || probe.contains("webmanual") || probe.contains("usermanual")) return "User's Manual";
-        if (probe.contains("carpay") || probe.contains("hyundaipay") || probe.contains("invehiclepay")) return "Hyundai Pay";
+        String probe = (p + "/" + c + " " + label).toLowerCase(Locale.US);
+        if (probe.contains("qrmanual") || probe.contains("webmanual") || probe.contains("usermanual")
+                || probe.contains("appmanual")) return "User's Manual";
+        if (probe.contains("carpay") || probe.contains("hyundaipay") || probe.contains("invehiclepay")
+                || probe.contains("paymentnew") || probe.contains(".payment")) return "Hyundai Pay";
+        if (probe.contains("notification") || probe.contains("noticecenter") || probe.contains("noticelist")) return "Notifications";
+        if (probe.contains("valetmode")) return "Valet Mode";
+        if (probe.contains("phoneprojection") || probe.contains("projection")) return "Phone Projection";
+        if (probe.contains("drvm") || probe.contains("rearcamera")) return "Driving Rear View";
         if (probe.contains("bluelink") || probe.contains("telematics")) return "Bluelink";
-        if (probe.contains("notification") || probe.contains("noticecenter")) return "Notifications";
         if (probe.contains("mnsoft") || probe.contains("navimenu") || probe.contains(".navi")) return "Navigation Menu";
-        if (probe.contains("com.hkmc.ev") || probe.contains(".evactivity")) return "EV";
+        if (probe.contains("com.hkmc.ev") || probe.contains(".evactivity") || probe.contains(".evmain")) return "EV";
         if (probe.contains("radio")) return "Radio";
-        return !label.isEmpty() ? label : (!pkg.isEmpty() ? pkg : "Home Tile");
+        return !label.isEmpty() ? label : (!p.isEmpty() ? p : "Home Tile");
     }
 
     static String readEffectiveConfigJson(Context ctx) {

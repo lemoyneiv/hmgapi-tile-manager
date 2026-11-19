@@ -26,7 +26,7 @@ import java.util.Set;
 public final class TileStore {
     private TileStore() {}
 
-    public static final int CATALOG_SCHEMA = 5;
+    public static final int CATALOG_SCHEMA = 6;
 
     public static final String ACTION_TILES_CHANGED = "dev.lemoyne.tiles.ACTION_TILES_CHANGED";
     public static final String ACTION_REQUEST_CATALOG = "dev.lemoyne.tiles.ACTION_REQUEST_CATALOG";
@@ -182,7 +182,8 @@ public final class TileStore {
             this.packageName = p;
             this.className = c;
             this.title = title == null ? "" : title.trim();
-            this.itemId = (itemId > 0 && itemId != 39) ? itemId : 1;
+            int resolvedId = (itemId > 0 && itemId != 39) ? itemId : defaultStockItemId(p, c);
+            this.itemId = (resolvedId > 0 && resolvedId != 39) ? resolvedId : 1;
             String norm = normKeyString(key);
             this.key = !norm.isEmpty() ? norm : normKey(p, c, this.itemId);
         }
@@ -774,6 +775,14 @@ public final class TileStore {
                 }
                 if (pkg.isEmpty() && cls.isEmpty()) {
                     for (String s : extraStrings) {
+                        if (stockPseudoTargetPackages(s) != null) {
+                            pkg = s;
+                            break;
+                        }
+                    }
+                }
+                if (pkg.isEmpty() && cls.isEmpty()) {
+                    for (String s : extraStrings) {
                         if (looksLikePackageName(s)) {
                             pkg = s;
                             break;
@@ -781,15 +790,34 @@ public final class TileStore {
                     }
                 }
                 if (!pkg.isEmpty() && cls.isEmpty()) {
-                    for (String s : extraStrings) {
-                        if (s.equals(pkg)) continue;
-                        if (s.startsWith(".") || s.startsWith(pkg + ".") || looksLikeClassName(s)) {
-                            cls = s;
-                            break;
+                    if (stockPseudoTargetPackages(pkg) != null) {
+                        for (String s : extraStrings) {
+                            if (pkg.equalsIgnoreCase(stockPseudoPackageForClass(s))) {
+                                cls = s;
+                                break;
+                            }
+                        }
+                        if (cls.isEmpty()) {
+                            cls = "phoneprojection_packagename".equalsIgnoreCase(pkg)
+                                    ? "PhoneProjection_ClassName" : pkg;
+                        }
+                    } else {
+                        for (String s : extraStrings) {
+                            if (s.equals(pkg)) continue;
+                            if (s.startsWith(".") || s.startsWith(pkg + ".") || looksLikeClassName(s)) {
+                                cls = s;
+                                break;
+                            }
                         }
                     }
                 } else if (pkg.isEmpty() && cls.isEmpty()) {
                     for (String s : extraStrings) {
+                        String mappedPseudo = stockPseudoPackageForClass(s);
+                        if (mappedPseudo != null) {
+                            pkg = mappedPseudo;
+                            cls = s;
+                            break;
+                        }
                         if (looksLikeClassName(s)) {
                             cls = s;
                             break;
@@ -1036,9 +1064,119 @@ public final class TileStore {
         return cl >= 'A' && cl <= 'Z';
     }
 
+    /**
+     * Maps Gen5W Launcher_WP3 / HKMC_HomeSetting_WP virtual stock pseudo-package tokens
+     * (carpay, notification, valetmode, PhoneProjection_PackageName, DRVM) to the real
+     * /system/app manifest package names that implement them on Gen5W firmware, or null if
+     * pkg is a normal Android package name.
+     */
+    public static String[] stockPseudoTargetPackages(String pkg) {
+        String low = cleanToken(pkg).toLowerCase(Locale.US);
+        if (low.isEmpty()) return null;
+        if ("carpay".equals(low)) {
+            return new String[] {
+                "com.hkmc.telematics.app.paymentnew",
+                "com.hkmc.telematics.app.payment",
+                "com.hkmc.telematics.apps.carpay",
+                "com.hkmc.carpay"
+            };
+        }
+        if ("notification".equals(low)) {
+            return new String[] {
+                "com.hkmc.telematics.apps.Notification",
+                "com.hkmc.telematics.app.notification",
+                "com.hkmc.notification"
+            };
+        }
+        if ("valetmode".equals(low)) {
+            return new String[] {
+                "com.hkmc.telematics.apps.valetMode",
+                "com.hkmc.telematics.app.valetmode",
+                "com.hmc.valetmode",
+                "com.hkmc.valetmode"
+            };
+        }
+        if ("phoneprojection_packagename".equals(low)) {
+            return new String[] {
+                "com.daudio.app.phoneprojection",
+                "com.daudio.app.dipo",
+                "com.google.android.projection.sink",
+                "com.baidu.carlifevehicle",
+                "com.daudio.app.mirrorlink"
+            };
+        }
+        if ("drvm".equals(low)) {
+            return new String[] {
+                "com.hkmc.system.app.rearcamera",
+                "com.hkmc.av.app.rearcamera"
+            };
+        }
+        return null;
+    }
+
+    public static String stockPseudoPackageForClass(String cls) {
+        String low = cleanToken(cls).toLowerCase(Locale.US);
+        if ("phoneprojection_classname".equals(low)) return "PhoneProjection_PackageName";
+        if ("carpay".equals(low)) return "carpay";
+        if ("notification".equals(low)) return "notification";
+        if ("valetmode".equals(low)) return "valetmode";
+        if ("drvm".equals(low)) return "DRVM";
+        return null;
+    }
+
+    /**
+     * Returns true for the 4 virtual pseudo-package tiles in Launcher_WP3's aH menu builder
+     * (carpay, notification, valetmode, PhoneProjection_PackageName) that Launcher_WP3 already
+     * gates against native VariantCoding / vehicle support flags before instantiating. Allowing
+     * these from Launcher_WP3's live list lets Tile Manager display and re-seat them even if a
+     * prior version orphaned their all_menu slots and pruned their backups, without exposing
+     * unequipped features (since Launcher_WP3 never instantiates them when unsupported).
+     */
+    public static boolean isLauncherGatedPseudoTile(String pkg, String cls) {
+        String low = cleanToken(pkg).toLowerCase(Locale.US);
+        if (low.isEmpty()) low = cleanToken(stockPseudoPackageForClass(cls)).toLowerCase(Locale.US);
+        return "carpay".equals(low)
+                || "notification".equals(low)
+                || "valetmode".equals(low)
+                || "phoneprojection_packagename".equals(low);
+    }
+
+    /**
+     * Returns the canonical HKMC_HomeSetting_WP all_menu itemId (from homesetting.c.r.dg) for
+     * standard Gen5W stock entries when re-seating an orphaned tile whose itemId was not preserved,
+     * or -1 if unknown.
+     */
+    public static int defaultStockItemId(String pkg, String cls) {
+        String p = cleanToken(pkg);
+        String c = cleanToken(cls);
+        String fullCls = expandClass(p, c);
+        String lowP = p.toLowerCase(Locale.US);
+        String lowC = fullCls.toLowerCase(Locale.US);
+        if ("phoneprojection_packagename".equals(lowP) || "phoneprojection_classname".equals(lowC)) return 4;
+        if ("valetmode".equals(lowP) || "valetmode".equals(lowC)) return 14;
+        if ("carpay".equals(lowP) || "carpay".equals(lowC)) return 21;
+        if ("notification".equals(lowP) || "notification".equals(lowC)) return 23;
+        if ("com.mnsoft.navi.mapapp".equals(lowC)) return 1;
+        if ("com.mnsoft.navi.naviapp".equals(lowC) || ("com.mnsoft.navi".equals(lowP) && (c.isEmpty() || "*".equals(c)))) return 2;
+        if ("com.android.contacts.dialtactsactivity".equals(lowC)) return 3;
+        if ("com.daudio.app.voicememo.mainactivity".equals(lowC)) return 6;
+        if ("com.hkmc.system.app.mymenu.mymenuactivity".equals(lowC)) return 7;
+        if ("com.android.settings.settings".equals(lowC)) return 8;
+        if (lowP.startsWith("com.hkmc.av.app.radio") && lowC.endsWith(".radiomainactivity")) return 9;
+        if ("com.daudio.av.app.usbmusic.ui.musicactivity".equals(lowC)) return 11;
+        if ("com.hkmc.telematics.apps.vrm.main.bluelinkuvomenu".equals(lowC)) return 12;
+        if ("com.android.settings.customviews.webmanualsub".equals(lowC)
+                || "com.android.settings.customviews.manualanddrivingtip".equals(lowC)) {
+            return 24;
+        }
+        if (lowP.startsWith("com.hkmc.daudio.app.") && lowC.endsWith(".igncheckactivity")) return 29;
+        return -1;
+    }
+
     public static boolean isStockOemPackage(String pkg) {
         String p = cleanToken(pkg);
         if (p.isEmpty()) return true;
+        if (stockPseudoTargetPackages(p) != null) return true;
         String low = p.toLowerCase(Locale.US);
         if (low.contains("nemesis") || low.contains("xwtk") || low.contains("hmgapi")
                 || low.contains("leafia") || low.contains("evergreen") || low.startsWith("dev.lemoyne.")) {
@@ -1083,7 +1221,9 @@ public final class TileStore {
                 || label.equalsIgnoreCase("QRManual")
                 || label.equalsIgnoreCase("AppManual")
                 || (label.indexOf('.') > 0 && label.indexOf(' ') < 0)
-                || label.equals(p);
+                || label.equalsIgnoreCase(p)
+                || stockPseudoTargetPackages(label) != null
+                || stockPseudoPackageForClass(label) != null;
         if (!looksTechnical) return label;
 
         String probe = (p + "/" + c + " " + label).toLowerCase(Locale.US);
@@ -1091,14 +1231,24 @@ public final class TileStore {
                 || probe.contains("appmanual")) {
             return "User's Manual";
         }
-        if (probe.contains("carpay") || probe.contains("hyundaipay") || probe.contains("invehiclepay")) {
+        if (probe.contains("carpay") || probe.contains("hyundaipay") || probe.contains("invehiclepay")
+                || probe.contains("paymentnew") || probe.contains(".payment")) {
             return "Hyundai Pay";
-        }
-        if (probe.contains("bluelink") || probe.contains("telematics.tms") || probe.contains("hkmc.telematics")) {
-            return "Bluelink";
         }
         if (probe.contains("notification") || probe.contains("noticecenter") || probe.contains("noticelist")) {
             return "Notifications";
+        }
+        if (probe.contains("valetmode")) {
+            return "Valet Mode";
+        }
+        if (probe.contains("phoneprojection") || probe.contains("projection")) {
+            return "Phone Projection";
+        }
+        if (probe.contains("drvm") || probe.contains("rearcamera")) {
+            return "Driving Rear View";
+        }
+        if (probe.contains("bluelink") || probe.contains("telematics.tms") || probe.contains("hkmc.telematics")) {
+            return "Bluelink";
         }
         if (probe.contains("mnsoft") || probe.contains("navimenu") || probe.contains(".navi")) {
             return "Navigation Menu";
@@ -1668,6 +1818,7 @@ public final class TileStore {
             return true;
         }
         if ("phone projection".equals(t) || p.contains(".projection")
+                || "phoneprojection_packagename".equals(p)
                 || p.equals("com.daudio.app.dipo") || p.equals("com.google.android.projection.sink")) {
             return true;
         }
@@ -1780,7 +1931,7 @@ public final class TileStore {
         }
     }
 
-    private static InstallChecker checkerFromKeySet(final Set<String> installedKeys) {
+    static InstallChecker checkerFromKeySet(final Set<String> installedKeys) {
         if (installedKeys == null) return null;
         return new InstallChecker() {
             @Override
@@ -1797,6 +1948,16 @@ public final class TileStore {
                         String prefix = p + "/";
                         for (String ik : installedKeys) {
                             if (ik.startsWith(prefix)) return true;
+                        }
+                    }
+                    String[] pseudoTargets = stockPseudoTargetPackages(p);
+                    if (pseudoTargets != null) {
+                        for (String tp : pseudoTargets) {
+                            if (installedKeys.contains(tp + "/*")) return true;
+                            String tpPrefix = tp + "/";
+                            for (String ik : installedKeys) {
+                                if (ik.startsWith(tpPrefix)) return true;
+                            }
                         }
                     }
                 } else if (!c.isEmpty()) {
@@ -1993,19 +2154,22 @@ public final class TileStore {
                     logs.add("saved menu (" + user + "): no empty slot to re-seat " + rt.key);
                     continue;
                 }
+                int effectiveId = rt.itemId > 0
+                        ? rt.itemId
+                        : Math.max(0, defaultStockItemId(rt.packageName, rt.className));
                 Map<String, Object> seated = new LinkedHashMap<String, Object>();
                 seated.put("packageName", rt.packageName);
-                seated.put("itemId", Long.valueOf(rt.itemId));
+                seated.put("itemId", Long.valueOf(effectiveId));
                 seated.put("className", rt.className);
                 arr.set(target, seated);
                 presentKeys.add(rt.key);
-                presentKeys.add(normKey(rt.packageName, rt.className, rt.itemId));
+                presentKeys.add(normKey(rt.packageName, rt.className, effectiveId));
                 presentPackages.add(rt.packageName);
                 if (!rt.className.isEmpty()) {
                     presentClasses.add(rt.className);
                     presentExpandedClasses.add(expandClass(rt.packageName, rt.className));
                 }
-                if (rt.itemId > 0) presentItemIds.add(Integer.valueOf(rt.itemId));
+                if (effectiveId > 0) presentItemIds.add(Integer.valueOf(effectiveId));
                 changed = true;
                 logs.add("saved menu (" + user + "): re-seated missing " + rt.key + " in slot " + (target + 1));
             }

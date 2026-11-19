@@ -410,6 +410,12 @@ final class SystemIconResolver {
                     new String[] { "dvrs", "builtincam", "blackbox", "cam" },
                     new String[] { "passenger", "passengerview" });
         }
+        if (title.contains("rear view") || title.contains("driving rear")
+                || all.contains("drvm") || pkg.contains("rearcamera")) {
+            return new FeatureRule(TileIcons.SYS_CAMERA,
+                    new String[] { "drvm", "rearcam", "rearcamera", "rearview" },
+                    new String[] { "passenger", "talk", "dvrs" });
+        }
 
         // 10. Quiet Mode / Rear Sleep Mode
         if (title.contains("quiet") || title.contains("sleep") || all.contains("quietmode")

@@ -402,9 +402,9 @@ public final class TileStoreTest {
                 TileStore.isEquippedSystemTile("com.hkmc.radio/com.hkmc.radio.RadioActivity",
                         "com.hkmc.radio", "com.hkmc.radio.RadioActivity", pkgOnlySettingsInv, multiPkgs));
 
-        // 16. v1.0.3 regressions: schema-5 parity, wildcard backup/equip/restore, EntryInspector
+        // 16. v1.0.3+ schema parity, wildcard backup/equip/restore, EntryInspector
         //     wildcard-matched itemId disambiguation, and renamed owner profile selection
-        check("TileStore.CATALOG_SCHEMA is 5", Integer.valueOf(5), Integer.valueOf(TileStore.CATALOG_SCHEMA));
+        check("TileStore.CATALOG_SCHEMA is 6", Integer.valueOf(6), Integer.valueOf(TileStore.CATALOG_SCHEMA));
 
         Map<String, Object> qrBackups = new LinkedHashMap<String, Object>();
         TileStore.Config hideQrManual = new TileStore.Config(true, true, setOf("com.hkmc.qrmanual/*"));
@@ -889,6 +889,149 @@ public final class TileStoreTest {
                 "com.hkmc.ev", slotPkg(collapseUnconfigured.updatedMenuJson, 1));
         check("unconfigured collapse trails Empty view at slot 2",
                 "Empty view", slotPkg(collapseUnconfigured.updatedMenuJson, 2));
+
+        // 21. Gen5W virtual stock pseudo-packages (NEEV Ioniq 5 & CEEV Ioniq 6):
+        //     carpay/carpay, notification/notification, valetmode/valetmode,
+        //     PhoneProjection_PackageName/PhoneProjection_ClassName, and DRVM/DRVM
+        checkTrue("carpay maps to paymentnew /system/app",
+                Arrays.asList(TileStore.stockPseudoTargetPackages("carpay"))
+                        .contains("com.hkmc.telematics.app.paymentnew"));
+        checkTrue("notification maps to Notification /system/app",
+                Arrays.asList(TileStore.stockPseudoTargetPackages("notification"))
+                        .contains("com.hkmc.telematics.apps.Notification"));
+        checkTrue("valetmode maps to valetMode /system/app",
+                Arrays.asList(TileStore.stockPseudoTargetPackages("valetmode"))
+                        .contains("com.hkmc.telematics.apps.valetMode"));
+        checkTrue("PhoneProjection_PackageName maps to phoneprojection /system/app",
+                Arrays.asList(TileStore.stockPseudoTargetPackages("PhoneProjection_PackageName"))
+                        .contains("com.daudio.app.phoneprojection"));
+        checkTrue("DRVM maps to rearcamera /system/app",
+                Arrays.asList(TileStore.stockPseudoTargetPackages("DRVM"))
+                        .contains("com.hkmc.system.app.rearcamera"));
+        check("normal package returns null pseudo targets", null,
+                TileStore.stockPseudoTargetPackages("com.hkmc.ev"));
+
+        check("PhoneProjection_ClassName maps back to PhoneProjection_PackageName",
+                "PhoneProjection_PackageName", TileStore.stockPseudoPackageForClass("PhoneProjection_ClassName"));
+        check("carpay class maps back to carpay pseudo package",
+                "carpay", TileStore.stockPseudoPackageForClass("carpay"));
+        check("notification class maps back to notification pseudo package",
+                "notification", TileStore.stockPseudoPackageForClass("notification"));
+
+        checkTrue("carpay is launcher-gated pseudo tile",
+                TileStore.isLauncherGatedPseudoTile("carpay", "carpay"));
+        checkTrue("notification is launcher-gated pseudo tile",
+                TileStore.isLauncherGatedPseudoTile("notification", "notification"));
+        checkTrue("valetmode is launcher-gated pseudo tile",
+                TileStore.isLauncherGatedPseudoTile("valetmode", "valetmode"));
+        checkTrue("PhoneProjection_PackageName is launcher-gated pseudo tile",
+                TileStore.isLauncherGatedPseudoTile("PhoneProjection_PackageName", "PhoneProjection_ClassName"));
+        check("DRVM is NOT treated as unconditional launcher-gated pseudo tile",
+                Boolean.FALSE, Boolean.valueOf(TileStore.isLauncherGatedPseudoTile("DRVM", "DRVM")));
+        checkTrue("PhoneProjection_PackageName is unconditional core stock tile",
+                TileStore.isUnconditionalCoreStockTile("Phone Projection", "PhoneProjection_PackageName", "PhoneProjection_ClassName"));
+
+        // Canonical HKMC_HomeSetting_WP c.r.dg itemId resolution
+        check("PhoneProjection canonical itemId is 4", Integer.valueOf(4),
+                Integer.valueOf(TileStore.defaultStockItemId("PhoneProjection_PackageName", "PhoneProjection_ClassName")));
+        check("valetmode canonical itemId is 14", Integer.valueOf(14),
+                Integer.valueOf(TileStore.defaultStockItemId("valetmode", "valetmode")));
+        check("carpay canonical itemId is 21", Integer.valueOf(21),
+                Integer.valueOf(TileStore.defaultStockItemId("carpay", "carpay")));
+        check("notification canonical itemId is 23", Integer.valueOf(23),
+                Integer.valueOf(TileStore.defaultStockItemId("notification", "notification")));
+
+        // Classification & friendly titles (including telematics Notification/valetMode vs Bluelink ordering)
+        for (String[] pseudoRow : new String[][] {
+                { "carpay", "carpay", "Hyundai Pay" },
+                { "notification", "notification", "Notifications" },
+                { "valetmode", "valetmode", "Valet Mode" },
+                { "PhoneProjection_PackageName", "PhoneProjection_ClassName", "Phone Projection" },
+                { "DRVM", "DRVM", "Driving Rear View" }
+        }) {
+            checkTrue(pseudoRow[0] + " is recognized as stock OEM package",
+                    TileStore.isStockOemPackage(pseudoRow[0]));
+            check(pseudoRow[0] + " classifies as system tile", "system",
+                    TileStore.classifyTileKind(pseudoRow[0], pseudoRow[0], -1, 0, false, null));
+            check(pseudoRow[0] + " resolves friendly system title " + pseudoRow[2], pseudoRow[2],
+                    TileStore.friendlySystemTitle(pseudoRow[0], pseudoRow[0], pseudoRow[1]));
+        }
+        check("telematics Notification APK resolves to Notifications (not Bluelink)", "Notifications",
+                TileStore.friendlySystemTitle("", "com.hkmc.telematics.apps.Notification", ".NotificationActivity"));
+        check("telematics valetMode APK resolves to Valet Mode (not Bluelink)", "Valet Mode",
+                TileStore.friendlySystemTitle("", "com.hkmc.telematics.apps.valetMode", ".ValetModeActivity"));
+        check("telematics paymentnew APK resolves to Hyundai Pay (not Bluelink)", "Hyundai Pay",
+                TileStore.friendlySystemTitle("", "com.hkmc.telematics.app.paymentnew", ".MainActivity"));
+        check("telematics Bluelink APK still resolves to Bluelink", "Bluelink",
+                TileStore.friendlySystemTitle("", "com.hkmc.telematics.apps.vrm", "com.hkmc.telematics.apps.vrm.main.BluelinkUVOMenu"));
+
+        // Uncalibrated EntryInspector extracts 2-arg/setter Q subclasses (aM carpay & Y notification)
+        // even when all_menu inventory is completely empty (orphaned slots)
+        TileStore.EntryInspector freshPseudoInspector = new TileStore.EntryInspector();
+        TileStore.MenuInventory emptyInv = TileStore.collectMenuInventory(Collections.<String>emptyList(), null);
+        MockQ qCarPay = MockQ.ctor7("carpay", "carpay", 0x7f020060, 0x7f020061, 0x7f080060, null);
+        MockQ qNotifPseudo = MockQ.ctor7("notification", "notification", 0x7f020062, 0x7f020063, 0x7f080061, null);
+        TileStore.EntryInspector.Extracted exCarPay = freshPseudoInspector.extract(
+                qCarPay, emptyInv, Collections.<String>emptySet(), null);
+        TileStore.EntryInspector.Extracted exNotifPseudo = freshPseudoInspector.extract(
+                qNotifPseudo, emptyInv, Collections.<String>emptySet(), null);
+        check("uncalibrated EntryInspector extracts carpay pkg", "carpay", exCarPay.pkg);
+        check("uncalibrated EntryInspector extracts carpay cls", "carpay", exCarPay.cls);
+        check("uncalibrated EntryInspector extracts notification pkg", "notification", exNotifPseudo.pkg);
+        check("uncalibrated EntryInspector extracts notification cls", "notification", exNotifPseudo.cls);
+
+        // Hide, backup retention against real /system/app PackageManager keys, restore, and orphan re-seating
+        String ceevMenu = "{\"menuItems\":["
+                + "{\"packageName\":\"com.hkmc.daudio.app.ev\",\"itemId\":29,\"className\":\"com.hkmc.daudio.app.ev.IgnCheckActivity\"},"
+                + "{\"packageName\":\"carpay\",\"itemId\":21,\"className\":\"carpay\"},"
+                + "{\"packageName\":\"notification\",\"itemId\":23,\"className\":\"notification\"},"
+                + "{\"packageName\":\"PhoneProjection_PackageName\",\"itemId\":4,\"className\":\"PhoneProjection_ClassName\"},"
+                + "{\"packageName\":\"Empty view\",\"itemId\":39,\"className\":\"Empty view\"}"
+                + "]}";
+        Set<String> realSystemInstalled = setOf(
+                "com.hkmc.daudio.app.ev/com.hkmc.daudio.app.ev.IgnCheckActivity",
+                "com.hkmc.telematics.app.paymentnew/com.hkmc.telematics.app.paymentnew.MainActivity",
+                "com.hkmc.telematics.apps.Notification/com.hkmc.telematics.apps.Notification.MainActivity",
+                "com.daudio.app.phoneprojection/com.daudio.app.phoneprojection.MainActivity");
+        Map<String, Object> ceevBackups = new LinkedHashMap<String, Object>();
+        TileStore.Config hidePayAndNotif = new TileStore.Config(true, false,
+                setOf("carpay/carpay", "notification/notification"));
+        TileStore.SyncResult ceevHid = TileStore.syncProfileMenu(
+                "Driver 1", ceevMenu, hidePayAndNotif, realSystemInstalled, ceevBackups);
+        checkTrue("hiding carpay/carpay and notification/notification updates CEEV menu",
+                ceevHid.updatedMenuJson != null);
+        check("slot 1 (carpay) cleared to Empty view", "Empty view", slotPkg(ceevHid.updatedMenuJson, 1));
+        check("slot 2 (notification) cleared to Empty view", "Empty view", slotPkg(ceevHid.updatedMenuJson, 2));
+
+        // Restoring with real /system/app package set MUST preserve & restore backups (never prune as uninstalled!)
+        TileStore.SyncResult ceevRestored = TileStore.syncProfileMenu(
+                "Driver 1", ceevHid.updatedMenuJson, showAllNoCompact, realSystemInstalled, ceevBackups);
+        checkTrue("unhiding carpay & notification restores from backup when /system/app targets exist",
+                ceevRestored.updatedMenuJson != null);
+        check("restored slot 1 is carpay", "carpay", slotPkg(ceevRestored.updatedMenuJson, 1));
+        check("restored slot 1 preserves itemId 21",
+                Integer.valueOf(21), Integer.valueOf(slotItemId(ceevRestored.updatedMenuJson, 1)));
+        check("restored slot 2 is notification", "notification", slotPkg(ceevRestored.updatedMenuJson, 2));
+        check("restored slot 2 preserves itemId 23",
+                Integer.valueOf(23), Integer.valueOf(slotItemId(ceevRestored.updatedMenuJson, 2)));
+
+        // Re-seating after v1.0.2-v1.0.6 pruned backup.json and left Empty view slots:
+        // ReconcileTile with itemId=-1 resolves canonical itemId 21 (carpay) & 23 (notification)!
+        List<TileStore.ReconcileTile> ceevOrphanReconcile = Arrays.asList(
+                new TileStore.ReconcileTile("carpay/carpay", "carpay", "carpay", "Hyundai Pay", -1),
+                new TileStore.ReconcileTile("notification/notification", "notification", "notification", "Notifications", -1));
+        TileStore.SyncResult ceevReseated = TileStore.syncProfileMenu(
+                "Driver 1", ceevHid.updatedMenuJson, showAllNoCompact,
+                TileStore.checkerFromKeySet(realSystemInstalled),
+                new LinkedHashMap<String, Object>(), ceevOrphanReconcile, Collections.<String>emptySet());
+        checkTrue("Show All re-seats orphaned carpay/carpay & notification/notification without backup.json",
+                ceevReseated.updatedMenuJson != null);
+        check("re-seated slot 1 is carpay", "carpay", slotPkg(ceevReseated.updatedMenuJson, 1));
+        check("re-seated slot 1 receives canonical itemId 21 (never -1 or 1)",
+                Integer.valueOf(21), Integer.valueOf(slotItemId(ceevReseated.updatedMenuJson, 1)));
+        check("re-seated slot 2 is notification", "notification", slotPkg(ceevReseated.updatedMenuJson, 2));
+        check("re-seated slot 2 receives canonical itemId 23 (never -1 or 1)",
+                Integer.valueOf(23), Integer.valueOf(slotItemId(ceevReseated.updatedMenuJson, 2)));
 
         System.out.println("TileStoreTest: " + checks + " checks passed");
     }

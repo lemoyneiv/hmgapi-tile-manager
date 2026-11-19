@@ -59,6 +59,7 @@ public final class SystemIconResolverTest {
                 "hom_quiet_66",
                 "hom_voicememo_66",
                 "hom_passenger_talk_66",
+                "hom_drvm_66",
                 "hom_climate_66",
                 "hom_weather_66",
                 "hom_setting_66"
@@ -118,6 +119,24 @@ public final class SystemIconResolverTest {
         check("Setup picks hom_setting_66 (not ims_seat or sml or _disabled)", "hom_setting_66",
                 SystemIconResolver.bestMatchingName(launcherDrawables,
                         sys("com.android.settings/com.android.settings.Settings", "com.android.settings", "com.android.settings.Settings", "Setup")));
+
+        // Virtual Gen5W stock pseudo-package keys (NEEV / CEEV)
+        check("carpay/carpay pseudo key picks hom_carpay_66", "hom_carpay_66",
+                SystemIconResolver.bestMatchingName(launcherDrawables,
+                        sys("carpay/carpay", "carpay", "carpay", "Hyundai Pay")));
+        check("notification/notification pseudo key picks hom_noti_66", "hom_noti_66",
+                SystemIconResolver.bestMatchingName(launcherDrawables,
+                        sys("notification/notification", "notification", "notification", "Notifications")));
+        check("valetmode/valetmode pseudo key picks hom_valet_66", "hom_valet_66",
+                SystemIconResolver.bestMatchingName(launcherDrawables,
+                        sys("valetmode/valetmode", "valetmode", "valetmode", "Valet Mode")));
+        check("PhoneProjection_PackageName pseudo key picks hom_phone_projection_66", "hom_phone_projection_66",
+                SystemIconResolver.bestMatchingName(launcherDrawables,
+                        sys("PhoneProjection_PackageName/PhoneProjection_ClassName",
+                                "PhoneProjection_PackageName", "PhoneProjection_ClassName", "Phone Projection")));
+        check("DRVM/DRVM pseudo key picks hom_drvm_66 (not passenger_view or passenger_talk)", "hom_drvm_66",
+                SystemIconResolver.bestMatchingName(launcherDrawables,
+                        sys("DRVM/DRVM", "DRVM", "DRVM", "Driving Rear View")));
 
         System.out.println("SystemIconResolverTest: " + checks + " checks passed");
     }

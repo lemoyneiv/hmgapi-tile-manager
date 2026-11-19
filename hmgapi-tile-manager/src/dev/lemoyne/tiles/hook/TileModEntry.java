@@ -202,7 +202,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("launcher tile manager v1.0.6 active in " + app.processName);
+        mod.log("launcher tile manager v1.0.7 active in " + app.processName);
     }
 
     private void hookEditor(final ModContext mod, final LoadedApp app) {
@@ -237,7 +237,7 @@ public final class TileModEntry extends ModEntry {
                 }
             }
         });
-        mod.log("menu editor tile manager v1.0.6 active in " + app.processName);
+        mod.log("menu editor tile manager v1.0.7 active in " + app.processName);
     }
 
     private static void hookEntryCtor(final ModContext mod, ClassLoader cl, String pointId,
@@ -311,12 +311,17 @@ public final class TileModEntry extends ModEntry {
         }
 
         if (pkg.isEmpty() && !cls.isEmpty()) {
-            synchronized (metaByEntry) {
-                String knownKey = keyByClassName.get(cls);
-                if (knownKey != null) {
-                    int slash = knownKey.indexOf('/');
-                    if (slash > 0 && !knownKey.startsWith("@")) {
-                        pkg = knownKey.substring(0, slash);
+            String pseudoPkg = TileStore.stockPseudoPackageForClass(cls);
+            if (pseudoPkg != null) {
+                pkg = pseudoPkg;
+            } else {
+                synchronized (metaByEntry) {
+                    String knownKey = keyByClassName.get(cls);
+                    if (knownKey != null) {
+                        int slash = knownKey.indexOf('/');
+                        if (slash > 0 && !knownKey.startsWith("@")) {
+                            pkg = knownKey.substring(0, slash);
+                        }
                     }
                 }
             }
@@ -713,6 +718,7 @@ public final class TileModEntry extends ModEntry {
                 boolean allowedInMenu = TileStore.isEquippedSystemTile(
                                 m.key, m.pkg, m.cls, m.itemId, inv, multiEntryPackages)
                         || TileStore.isUnconditionalCoreStockTile(m.title, m.pkg, m.cls)
+                        || TileStore.isLauncherGatedPseudoTile(m.pkg, m.cls)
                         || (cfg != null && TileStore.matchingHiddenKey(cfg.hidden, m.pkg, m.cls, m.itemId) != null);
                 if (!isTargetComponentInstalled(ctx, m.pkg, m.cls)
                         || !TileStore.isSupportedStockFeature(m.title, m.pkg, m.cls, facts)
@@ -725,7 +731,10 @@ public final class TileModEntry extends ModEntry {
                 }
             }
             putCatalogRow(catalogByKey, coveredPackages, m);
-            if (m.itemId > 0) coveredItemIds.add(Integer.valueOf(m.itemId));
+            int coveredId = m.itemId > 0
+                    ? m.itemId
+                    : ("system".equals(m.kind) ? TileStore.defaultStockItemId(m.pkg, m.cls) : -1);
+            if (coveredId > 0 && coveredId != 39) coveredItemIds.add(Integer.valueOf(coveredId));
             if ("system".equals(m.kind) && !m.title.isEmpty()) {
                 coveredSystemTitles.add(m.title.toLowerCase(Locale.US));
             }
@@ -841,7 +850,10 @@ public final class TileModEntry extends ModEntry {
         row.put("title", m.title);
         row.put("kind", m.kind);
         if (m.modId != null) row.put("mod", m.modId);
-        if (m.itemId > 0 && m.itemId != 39) row.put("itemId", Long.valueOf(m.itemId));
+        int effectiveItemId = (m.itemId > 0 && m.itemId != 39)
+                ? m.itemId
+                : ("system".equals(m.kind) ? TileStore.defaultStockItemId(m.pkg, m.cls) : -1);
+        if (effectiveItemId > 0 && effectiveItemId != 39) row.put("itemId", Long.valueOf(effectiveItemId));
         if (!m.iconPkg.isEmpty()) row.put("iconPkg", m.iconPkg);
         if (!m.iconType.isEmpty()) row.put("iconType", m.iconType);
         if (!m.iconName.isEmpty()) row.put("iconName", m.iconName);
@@ -862,6 +874,28 @@ public final class TileModEntry extends ModEntry {
     private static boolean isTargetComponentInstalled(Context ctx, String pkg, String cls) {
         String p = TileStore.cleanToken(pkg);
         if (ctx == null || p.isEmpty()) return true;
+        String[] pseudoTargets = TileStore.stockPseudoTargetPackages(p);
+        if (pseudoTargets != null) {
+            PackageManager pm = ctx.getPackageManager();
+            if (pm == null) return true;
+            for (String targetPkg : pseudoTargets) {
+                try {
+                    ApplicationInfo ai = pm.getApplicationInfo(targetPkg, 0);
+                    if (ai == null || !ai.enabled) continue;
+                    try {
+                        int appState = pm.getApplicationEnabledSetting(targetPkg);
+                        if (appState == PackageManager.COMPONENT_ENABLED_STATE_DISABLED || appState == 3) {
+                            continue;
+                        }
+                    } catch (Throwable ignored) {}
+                    return true;
+                } catch (PackageManager.NameNotFoundException ignored) {
+                } catch (Throwable ignored) {
+                    return true;
+                }
+            }
+            return false;
+        }
         try {
             PackageManager pm = ctx.getPackageManager();
             ApplicationInfo ai = pm.getApplicationInfo(p, 0);
@@ -1684,6 +1718,19 @@ public final class TileModEntry extends ModEntry {
                 String p = TileStore.cleanToken(pkg);
                 if (p.isEmpty()) return true;
                 if (pm == null) return true;
+                String[] pseudoTargets = TileStore.stockPseudoTargetPackages(p);
+                if (pseudoTargets != null) {
+                    for (String targetPkg : pseudoTargets) {
+                        try {
+                            ApplicationInfo ai = pm.getApplicationInfo(targetPkg, 0);
+                            if (ai != null) return true;
+                        } catch (PackageManager.NameNotFoundException ignored) {
+                        } catch (Throwable t) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 ApplicationInfo ai;
                 try {
                     ai = pm.getApplicationInfo(p, 0);

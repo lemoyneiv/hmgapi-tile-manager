@@ -23,6 +23,7 @@ has "hooks.jar contains ReconcileTile" "Ldev/lemoyne/tiles/hook/TileStore\$Recon
 has "hooks.jar contains ProfileSlot" "Ldev/lemoyne/tiles/hook/TileStore\$ProfileSlot;" "$HOOK_STRINGS"
 has "hooks.jar contains reorderProfileMenu" "reorderProfileMenu" "$HOOK_STRINGS"
 has "hooks.jar contains ACTION_OPEN_STOCK_EDITOR" "dev.lemoyne.tiles.ACTION_OPEN_STOCK_EDITOR" "$HOOK_STRINGS"
+has "hooks.jar contains stockPseudoTargetPackages" "stockPseudoTargetPackages" "$HOOK_STRINGS"
 
 APK_STRINGS=$(unzip -p "$B/app/TileManager.apk" classes.dex | strings)
 has "apk contains MainActivity" "Ldev/lemoyne/tiles/MainActivity;" "$APK_STRINGS"
@@ -38,7 +39,7 @@ has "apk contains ACTION_OPEN_STOCK_EDITOR" "dev.lemoyne.tiles.ACTION_OPEN_STOCK
 has "apk contains Edit Home Icons button" "Edit Home Icons" "$APK_STRINGS"
 has "apk contains Collapse Empty Spaces button" "Collapse Empty Spaces" "$APK_STRINGS"
 has "apk contains author credit" "by lemoyneiv" "$APK_STRINGS"
-has "apk contains v1.0.6 header" "v1.0.6" "$APK_STRINGS"
+has "apk contains v1.0.7 header" "v1.0.7" "$APK_STRINGS"
 
 HOOK_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/src/dev/lemoyne/tiles/hook/TileStore.java" | head -n 1)
 APP_SCHEMA=$(sed -n 's/.*CATALOG_SCHEMA *= *\([0-9][0-9]*\).*/\1/p' "$M/app/java/dev/lemoyne/tiles/TileCatalogProvider.java" | head -n 1)

@@ -210,7 +210,7 @@ public final class MainActivity extends Activity {
         brandText.addView(title);
 
         TextView lblAuthor = new TextView(this);
-        lblAuthor.setText("by lemoyneiv · v1.0.6");
+        lblAuthor.setText("by lemoyneiv · v1.0.7");
         lblAuthor.setTextColor(ON_SURFACE_VAR);
         lblAuthor.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         lblAuthor.setSingleLine(true);
